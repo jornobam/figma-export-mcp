@@ -415,7 +415,10 @@ describe("immutable plans, variables and ZIP", () => {
 describe("configuration", () => {
   it("uses portable defaults and never requires secrets", () => {
     const config = loadConfig({});
-    expect(config.stateDir).toContain("figma-export-mcp");
+    expect(path.isAbsolute(config.stateDir)).toBe(true);
+    expect(config.stateDir.toLocaleLowerCase("en").replaceAll(/[^a-z]/gu, "")).toContain(
+      "figmaexportmcp",
+    );
     expect(config.figmaToken).toBeUndefined();
     expect(config.yandexToken).toBeUndefined();
   });
