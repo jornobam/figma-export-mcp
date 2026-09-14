@@ -20,7 +20,37 @@
         "idMap": { "type": "object", "additionalProperties": { "type": "string" } }
       }
     },
-    "position_selection": { "type": "object" },
+    "position_selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "layout": { "enum": ["rows", "columns"], "default": "rows" },
+        "rows": {
+          "oneOf": [
+            { "const": "all" },
+            { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1 }
+          ]
+        },
+        "columns": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+        "first": { "type": "integer", "minimum": 1 },
+        "last": { "type": "integer", "minimum": 1 },
+        "range": { "$ref": "#/$defs/positionRange" },
+        "everyNth": { "type": "integer", "minimum": 1 },
+        "explicitIndexes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "perGroupLimit": { "type": "integer", "minimum": 1 },
+        "rowRules": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/rowRule" }
+        },
+        "missingPositionPolicy": {
+          "enum": ["clarify", "skip", "fail", "complete-rows-only"]
+        },
+        "indexBase": { "const": 1 }
+      }
+    },
     "export": {
       "type": "object",
       "properties": {
@@ -48,6 +78,42 @@
     "expected": { "type": "object" }
   },
   "$defs": {
+    "positionRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to"],
+      "properties": {
+        "from": { "type": "integer", "minimum": 1 },
+        "to": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "positionRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "first": { "type": "integer", "minimum": 1 },
+        "last": { "type": "integer", "minimum": 1 },
+        "explicitIndexes": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "range": { "$ref": "#/$defs/positionRange" },
+        "everyNth": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "rowRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rows": {
+          "oneOf": [
+            { "const": "all" },
+            { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1 }
+          ]
+        },
+        "positions": { "$ref": "#/$defs/positionRule" }
+      }
+    },
     "stringMatcher": {
       "type": "object",
       "properties": {

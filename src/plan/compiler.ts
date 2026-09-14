@@ -7,6 +7,7 @@ import {
   ensureCaseInsensitiveUnique,
   joinRemotePath,
   makeId,
+  resolveJobFolder,
   sanitizeSegment,
   sha256,
 } from "../util.js";
@@ -80,79 +81,116 @@ function selectedByPositions(
 ): Match[] {
   const selection = input.position_selection;
   if (!selection) return matches;
-  const rows = new Map<number, Match[]>();
+  const groups = new Map<number, Match[]>();
+  const isRows = selection.layout === "rows";
+  const groupLabel = isRows ? "Row" : "Column";
+  const groupIndex = (match: Match) => (isRows ? match.layout.rowIndex : match.layout.columnIndex);
+  const positionIndex = (match: Match) =>
+    isRows ? match.layout.columnIndex : match.layout.rowIndex;
   for (const match of matches) {
-    if (match.layout.rowIndex !== undefined)
-      rows.set(match.layout.rowIndex, [...(rows.get(match.layout.rowIndex) ?? []), match]);
+    const index = groupIndex(match);
+    if (index !== undefined) groups.set(index, [...(groups.get(index) ?? []), match]);
   }
-  for (const row of rows.values()) {
-    row.sort(
+  for (const group of groups.values()) {
+    group.sort(
       (a, b) =>
-        (a.layout.columnIndex ?? 0) - (b.layout.columnIndex ?? 0) ||
+        (positionIndex(a) ?? 0) - (positionIndex(b) ?? 0) ||
         a.exportNode.id.localeCompare(b.exportNode.id, "en"),
     );
   }
   const selected = new Map<string, Match>();
-  const wantedRows = selection.rows === "all" ? [...rows.keys()] : selection.rows;
-  const addIndexes = (rowNumber: number, positions: number[]) => {
-    const row = rows.get(rowNumber) ?? [];
+  const wantedGroups = selection.rows === "all" ? [...groups.keys()] : selection.rows;
+  const addIndexes = (groupNumber: number, positions: number[]) => {
+    const group = groups.get(groupNumber) ?? [];
+    let added = 0;
     for (const position of positions) {
-      const match = row[position - 1];
+      const match = group[position - 1];
       if (match) {
-        selected.set(match.exportNode.id, match);
+        if (!selection.perGroupLimit || added < selection.perGroupLimit) {
+          selected.set(match.exportNode.id, match);
+          added += 1;
+        }
       } else if (selection.missingPositionPolicy === "clarify") {
         clarifications.push({
           code: "MISSING_ROW_POSITION",
-          message: `Row ${rowNumber} has no position ${position}`,
+          message: `${groupLabel} ${groupNumber} has no position ${position}`,
           blocking: true,
           options: ["skip", "fail", "complete-rows-only"],
         });
       } else if (selection.missingPositionPolicy === "fail") {
         clarifications.push({
           code: "MISSING_ROW_POSITION",
-          message: `Row ${rowNumber} has no position ${position}`,
+          message: `${groupLabel} ${groupNumber} has no position ${position}`,
           blocking: true,
         });
       } else {
-        warnings.push(`Skipped missing position ${position} in row ${rowNumber}`);
+        warnings.push(
+          `Skipped missing position ${position} in ${groupLabel.toLowerCase()} ${groupNumber}`,
+        );
       }
     }
   };
-  for (const rowNumber of wantedRows) {
-    const row = rows.get(rowNumber) ?? [];
+  const addRulePositions = (
+    positions: Set<number>,
+    rule: {
+      first?: number;
+      last?: number;
+      range?: { from: number; to: number };
+      everyNth?: number;
+      explicitIndexes?: number[];
+    },
+    length: number,
+  ) => {
+    for (const item of rule.explicitIndexes ?? []) positions.add(item);
+    if (rule.first)
+      for (let index = 1; index <= Math.min(rule.first, length); index += 1) positions.add(index);
+    if (rule.last)
+      for (let index = Math.max(1, length - rule.last + 1); index <= length; index += 1)
+        positions.add(index);
+    if (rule.range)
+      for (let index = rule.range.from; index <= rule.range.to; index += 1) positions.add(index);
+    if (rule.everyNth)
+      for (let index = rule.everyNth; index <= length; index += rule.everyNth) positions.add(index);
+  };
+  const hasGlobalPositions = Boolean(
+    selection.columns?.length ||
+      selection.explicitIndexes?.length ||
+      selection.first ||
+      selection.last ||
+      selection.range ||
+      selection.everyNth,
+  );
+  for (const groupNumber of wantedGroups) {
+    const group = groups.get(groupNumber) ?? [];
     const positions = new Set<number>();
     for (const item of selection.columns ?? selection.explicitIndexes ?? []) positions.add(item);
-    if (selection.first)
-      for (let index = 1; index <= Math.min(selection.first, row.length); index += 1)
-        positions.add(index);
-    if (selection.last)
-      for (
-        let index = Math.max(1, row.length - selection.last + 1);
-        index <= row.length;
-        index += 1
-      )
-        positions.add(index);
-    if (selection.range)
-      for (let index = selection.range.from; index <= selection.range.to; index += 1)
-        positions.add(index);
-    if (selection.everyNth)
-      for (let index = selection.everyNth; index <= row.length; index += selection.everyNth)
-        positions.add(index);
-    if (!positions.size) {
-      for (let index = 0; index < row.length; index += 1) positions.add(index + 1);
+    addRulePositions(positions, selection, group.length);
+    const matchingRules = (selection.rowRules ?? []).filter(
+      (rule) => rule.rows === "all" || rule.rows.includes(groupNumber),
+    );
+    if (matchingRules.length) {
+      positions.clear();
+      for (const rule of matchingRules) {
+        if (rule.positions) addRulePositions(positions, rule.positions, group.length);
+        else for (let index = 1; index <= group.length; index += 1) positions.add(index);
+      }
+    } else if (selection.rowRules?.length && !hasGlobalPositions) {
+      continue;
+    }
+    if (!positions.size && !selection.rowRules?.length) {
+      for (let index = 0; index < group.length; index += 1) positions.add(index + 1);
     }
     if (
       selection.missingPositionPolicy === "complete-rows-only" &&
-      [...positions].some((index) => index > row.length)
+      [...positions].some((index) => index > group.length)
     ) {
-      warnings.push(`Skipped incomplete row ${rowNumber}`);
+      warnings.push(`Skipped incomplete ${groupLabel.toLowerCase()} ${groupNumber}`);
       continue;
     }
-    addIndexes(rowNumber, [...positions]);
-  }
-  if (selection.perGroupLimit) {
-    const perGroupLimit = selection.perGroupLimit;
-    return [...selected.values()].filter((_, index) => index < perGroupLimit * wantedRows.length);
+    addIndexes(
+      groupNumber,
+      [...positions].sort((a, b) => a - b),
+    );
   }
   return [...selected.values()];
 }
@@ -329,6 +367,12 @@ export function compileExportPlan(
     }
   }
   const missingTemplateVariables = new Set<string>();
+  const effectiveJobFolder = resolveJobFolder(
+    input.destination.job_folder,
+    input.collision_policy,
+    snapshot.version,
+    input.naming.max_segment_length,
+  );
   const manifest = matches.map((match, index) => {
     const folders = input.grouping.folders.map((template) =>
       sanitizeSegment(
@@ -340,12 +384,7 @@ export function compileExportPlan(
       renderTemplate(input.naming.template, match.variables, missingTemplateVariables),
       input.naming.max_segment_length,
     );
-    const remotePath = joinRemotePath(
-      requestedRoot,
-      input.destination.job_folder,
-      ...folders,
-      filename,
-    );
+    const remotePath = joinRemotePath(requestedRoot, effectiveJobFolder, ...folders, filename);
     return {
       id: makeId("item"),
       ordinal: index + 1,

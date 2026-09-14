@@ -25,6 +25,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "start": "node dist/stdio.js",
     "build": "tsc -p tsconfig.build.json",
     "clean": "node scripts/clean.mjs",
     "dev": "node --import tsx src/stdio.ts",
@@ -51,6 +52,6 @@
     "@types/node": "20.19.43",
     "tsx": "4.20.6",
     "typescript": "5.9.3",
-    "vitest": "3.2.4"
+    "vitest": "^4.1.11"
   }
 }

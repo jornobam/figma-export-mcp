@@ -92,7 +92,7 @@ positionSelection:
   indexBase: 1
 ```
 
-Также: first, last, range, everyNth, explicitIndexes, perGroupLimit. Неодинаковая длина строк должна попадать в warnings.
+Также: first, last, range, everyNth, explicitIndexes, perGroupLimit. `perGroupLimit` применяется отдельно к каждой строке или колонке. `layout: columns` транспонирует выбор: группы образуются по колонкам, а позиции считаются сверху вниз. `rowRules` переопределяет общие позиции для указанных групп. Неодинаковая длина строк должна попадать в warnings.
 
 ## Ordering
 

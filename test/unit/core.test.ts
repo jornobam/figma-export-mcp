@@ -4,10 +4,11 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config.js";
 import { CreateExportPlanInputSchema } from "../../src/domain/schemas.js";
+import type { Match } from "../../src/domain/types.js";
 import { normalizeFigmaFile } from "../../src/figma/snapshot.js";
 import { normalizeNodeId, parseFigmaReference } from "../../src/figma/url.js";
 import { createZip } from "../../src/packaging/zip.js";
-import { compileExportPlan } from "../../src/plan/compiler.js";
+import { compileExportPlan, selectedByPositions } from "../../src/plan/compiler.js";
 import { querySnapshot, safeRegex } from "../../src/selection/engine.js";
 import { analyzeGeometry } from "../../src/selection/geometry.js";
 import { StateStore } from "../../src/state/store.js";
@@ -72,6 +73,38 @@ function fixture() {
   });
 }
 
+function layoutMatch(id: string, rowIndex: number, columnIndex: number): Match {
+  const node = {
+    id,
+    type: "FRAME",
+    name: id,
+    childIds: [],
+    hierarchyPath: [id],
+    visible: true,
+    descendantTexts: [],
+    componentProperties: {},
+    siblingIndex: columnIndex,
+  };
+  return {
+    node,
+    exportNode: node,
+    reasons: [],
+    variables: {},
+    layout: { rowIndex, columnIndex, groupKey: "grid" },
+    confidence: 1,
+  };
+}
+
+function positionInput(positionSelection: Record<string, unknown>) {
+  return CreateExportPlanInputSchema.parse({
+    snapshot_id: "snap_fixture",
+    selection: { type: { in: ["FRAME"] } },
+    position_selection: positionSelection,
+    ordering: { mode: "row-major" },
+    destination: { job_folder: "Test" },
+  });
+}
+
 describe("Figma URL and safe path primitives", () => {
   it("parses file and node IDs in both URL spellings", () => {
     expect(parseFigmaReference("https://www.figma.com/design/abcdef123/My?node-id=12-34")).toEqual({
@@ -126,6 +159,46 @@ describe("universal selector and geometry engine", () => {
     expect(() => safeRegex("(a+)+")).toThrowError(/unsafe|complex/iu);
     expect(safeRegex("RAL\\s*\\d{4}", "iu")).toBeInstanceOf(RegExp);
   });
+
+  it("applies perGroupLimit independently and supports rowRules", () => {
+    const matches = [1, 2].flatMap((row) =>
+      [1, 2, 3].map((column) => layoutMatch(`r${row}c${column}`, row, column)),
+    );
+    const limited = selectedByPositions(
+      matches,
+      positionInput({ layout: "rows", columns: [2, 3], perGroupLimit: 1 }),
+      [],
+      [],
+    );
+    expect(limited.map((match) => match.exportNode.id)).toEqual(["r1c2", "r2c2"]);
+
+    const ruled = selectedByPositions(
+      matches,
+      positionInput({
+        layout: "rows",
+        rowRules: [
+          { rows: [1], positions: { explicitIndexes: [3] } },
+          { rows: [2], positions: { first: 1 } },
+        ],
+      }),
+      [],
+      [],
+    );
+    expect(ruled.map((match) => match.exportNode.id)).toEqual(["r1c3", "r2c1"]);
+  });
+
+  it("transposes grouping when position layout is columns", () => {
+    const matches = [1, 2].flatMap((row) =>
+      [1, 2, 3].map((column) => layoutMatch(`r${row}c${column}`, row, column)),
+    );
+    const selected = selectedByPositions(
+      matches,
+      positionInput({ layout: "columns", explicitIndexes: [2] }),
+      [],
+      [],
+    );
+    expect(selected.map((match) => match.exportNode.id)).toEqual(["r2c1", "r2c2", "r2c3"]);
+  });
 });
 
 describe("immutable plans, variables and ZIP", () => {
@@ -159,6 +232,21 @@ describe("immutable plans, variables and ZIP", () => {
       100,
     );
     expect(changed.digest).not.toBe(plan.digest);
+  });
+
+  it("applies a stable source-version suffix to the entire versioned job", () => {
+    const snapshot = fixture();
+    const input = CreateExportPlanInputSchema.parse({
+      snapshot_id: snapshot.id,
+      selection: { type: { in: ["FRAME"] }, visible: true },
+      ordering: { mode: "row-major" },
+      naming: { template: "{index}.{ext}" },
+      destination: { root: "/AI Exports", job_folder: "Versioned" },
+      collision_policy: "version",
+    });
+    const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
+    expect(plan.manifest.length).toBeGreaterThan(1);
+    expect(plan.manifest.every((item) => item.remotePath.includes("/Versioned--v-42/"))).toBe(true);
   });
 
   it("writes a valid deterministic ZIP and persists state atomically", async () => {

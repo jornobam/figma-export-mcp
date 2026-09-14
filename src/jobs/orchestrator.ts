@@ -8,7 +8,14 @@ import { AppError, appError, toSafeError } from "../errors.js";
 import type { FigmaClient } from "../figma/client.js";
 import { createZip } from "../packaging/zip.js";
 import type { StateStore } from "../state/store.js";
-import { assertInside, joinRemotePath, makeId, mapLimit, sanitizeSegment } from "../util.js";
+import {
+  assertInside,
+  joinRemotePath,
+  makeId,
+  mapLimit,
+  resolveJobFolder,
+  sanitizeSegment,
+} from "../util.js";
 import type { YandexDiskClient } from "../yandex/client.js";
 
 export class JobOrchestrator {
@@ -234,7 +241,11 @@ export class JobOrchestrator {
     await this.save(job);
   }
 
-  private async prepareArchives(job: ExportJob, input: CreateExportPlanInput): Promise<void> {
+  private async prepareArchives(
+    job: ExportJob,
+    input: CreateExportPlanInput,
+    sourceVersion: string,
+  ): Promise<void> {
     if (input.packaging.mode === "folders" || job.items.some((item) => item.kind === "archive"))
       return;
     const sources = job.items.filter((item) => item.kind !== "archive");
@@ -251,8 +262,14 @@ export class JobOrchestrator {
     } else {
       groups.set("archive", sources);
     }
+    const effectiveJobFolder = resolveJobFolder(
+      input.destination.job_folder,
+      input.collision_policy,
+      sourceVersion,
+      input.naming.max_segment_length,
+    );
     for (const [key, items] of groups) {
-      const commonPrefix = joinRemotePath(input.destination.root, input.destination.job_folder);
+      const commonPrefix = joinRemotePath(input.destination.root, effectiveJobFolder);
       const entries = await Promise.all(
         items.map(async (item) => ({
           name: item.remotePath.startsWith(`${commonPrefix}/`)
@@ -273,11 +290,7 @@ export class JobOrchestrator {
         matchedNodeId: `archive:${key}`,
         hierarchyPath: ["archive", key],
         variables: { archive_group: key, ext: "zip" },
-        remotePath: joinRemotePath(
-          input.destination.root,
-          input.destination.job_folder,
-          archiveName,
-        ),
+        remotePath: joinRemotePath(input.destination.root, effectiveJobFolder, archiveName),
         reasons: ["packaging"],
         confidence: 1,
         kind: "archive",
@@ -360,7 +373,7 @@ export class JobOrchestrator {
         }
       });
     }
-    await this.prepareArchives(job, input);
+    await this.prepareArchives(job, input, plan.source.version);
     const uploadSources =
       input.packaging.mode === "folders" || input.packaging.mode === "filesAndZip";
     const deliverable = job.items.filter(

@@ -48,6 +48,17 @@ export function sanitizeSegment(raw: string, maxLength = 120): string {
   return Array.from(nonEmpty).slice(0, maxLength).join("");
 }
 
+export function resolveJobFolder(
+  jobFolder: string,
+  collisionPolicy: "error" | "version" | "skip_identical",
+  sourceVersion: string,
+  maxLength = 120,
+): string {
+  if (collisionPolicy !== "version") return sanitizeSegment(jobFolder, maxLength);
+  const version = sanitizeSegment(sourceVersion, 40);
+  return sanitizeSegment(`${jobFolder}--v-${version}`, maxLength);
+}
+
 export function joinRemotePath(root: string, ...segments: string[]): string {
   const normalizedRoot = `/${root
     .replaceAll("\\", "/")

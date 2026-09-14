@@ -7,7 +7,7 @@ coverage/
 .cache/
 .tmp/
 tmp/
-state/
+/state/
 *.log
 *.sqlite
 *.sqlite-shm
