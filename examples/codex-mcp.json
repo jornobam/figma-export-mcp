@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "figma-export": {
+      "command": "node",
+      "args": ["/absolute/path/to/figma-export-mcp-spec/dist/stdio.js"],
+      "env": {
+        "FIGMA_TOKEN": "${FIGMA_TOKEN}",
+        "YANDEX_DISK_TOKEN": "${YANDEX_DISK_TOKEN}",
+        "YANDEX_DISK_ROOT": "/AI Exports"
+      }
+    }
+  }
+}

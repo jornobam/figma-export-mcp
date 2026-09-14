@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/figma-export-mcp/export-plan-v1.schema.json",
+  "title": "Figma Export MCP plan input v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["snapshot_id", "destination"],
+  "properties": {
+    "snapshot_id": { "type": "string", "minLength": 1 },
+    "selection": { "$ref": "#/$defs/selector" },
+    "export_target": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "enum": ["self", "parent", "nearestAncestor", "ancestorAtDepth", "explicitIdMap"]
+        },
+        "where": { "$ref": "#/$defs/selector" },
+        "maxDepth": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "depth": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "idMap": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "position_selection": { "type": "object" },
+    "export": {
+      "type": "object",
+      "properties": {
+        "format": { "enum": ["png", "jpg", "svg", "pdf"] },
+        "scale": { "type": "number", "minimum": 0.01, "maximum": 4 },
+        "contents_only": { "type": "boolean" },
+        "use_absolute_bounds": { "type": "boolean" }
+      }
+    },
+    "ordering": { "type": "object" },
+    "variables": { "type": "object" },
+    "grouping": { "type": "object" },
+    "naming": { "type": "object" },
+    "destination": {
+      "type": "object",
+      "required": ["job_folder"],
+      "properties": {
+        "provider": { "const": "yandex-disk" },
+        "root": { "type": "string" },
+        "job_folder": { "type": "string", "minLength": 1 }
+      }
+    },
+    "packaging": { "type": "object" },
+    "collision_policy": { "enum": ["error", "version", "skip_identical"] },
+    "expected": { "type": "object" }
+  },
+  "$defs": {
+    "stringMatcher": {
+      "type": "object",
+      "properties": {
+        "exact": { "type": "string" },
+        "contains": { "type": "string" },
+        "normalizedExact": { "type": "string" },
+        "regex": { "type": "string", "maxLength": 500 },
+        "flags": { "type": "string", "pattern": "^[gimsuy]*$" },
+        "oneOf": { "type": "array", "items": { "type": "string" } },
+        "caseSensitive": { "type": "boolean" }
+      }
+    },
+    "selector": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }]
+        },
+        "type": {
+          "type": "object",
+          "properties": { "in": { "type": "array", "items": { "type": "string" }, "minItems": 1 } }
+        },
+        "name": { "$ref": "#/$defs/stringMatcher" },
+        "text": { "$ref": "#/$defs/stringMatcher" },
+        "descendantText": { "$ref": "#/$defs/stringMatcher" },
+        "page": { "$ref": "#/$defs/stringMatcher" },
+        "section": { "$ref": "#/$defs/stringMatcher" },
+        "hierarchyPath": { "$ref": "#/$defs/stringMatcher" },
+        "componentName": { "$ref": "#/$defs/stringMatcher" },
+        "visible": { "type": "boolean" },
+        "includeIds": { "type": "array", "items": { "type": "string" } },
+        "excludeIds": { "type": "array", "items": { "type": "string" } },
+        "all": { "type": "array", "items": { "$ref": "#/$defs/selector" } },
+        "any": { "type": "array", "items": { "$ref": "#/$defs/selector" } },
+        "not": { "$ref": "#/$defs/selector" }
+      }
+    }
+  }
+}

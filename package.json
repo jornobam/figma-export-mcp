@@ -1,0 +1,56 @@
+{
+  "name": "figma-export-mcp",
+  "version": "1.0.0",
+  "description": "Production-ready STDIO MCP server for bulk Figma export to Yandex Disk",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "figma-export-mcp": "dist/stdio.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "schemas",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "node scripts/clean.mjs",
+    "dev": "node --import tsx src/stdio.ts",
+    "format": "biome format --write .",
+    "lint": "biome check .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration test/e2e",
+    "mcp:inspect": "npm run build && node scripts/mcp-smoke.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run build && npm run mcp:inspect",
+    "prepack": "npm run check",
+    "release:artifact": "npm run build && npm pack --ignore-scripts",
+    "security:audit": "npm audit --omit=dev --audit-level=high",
+    "live:smoke": "node scripts/live-smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.13",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@types/node": "20.19.43",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}
