@@ -75,6 +75,7 @@ export type LayoutInfo = {
   columnIndex?: number;
   blockIndex?: number;
   groupKey?: string;
+  dimensionsSimilarToPeers?: boolean;
 };
 
 export type Match = {

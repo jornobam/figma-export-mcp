@@ -33,8 +33,9 @@ function matchesString(value: string | undefined, matcher: StringMatcher): boole
   const caseSensitive = matcher.caseSensitive ?? false;
   const compared = caseSensitive ? normalized : normalized.toLocaleLowerCase("und");
   if (matcher.exact !== undefined) {
-    const expected = caseSensitive ? matcher.exact : matcher.exact.toLocaleLowerCase("und");
-    return value === expected;
+    return caseSensitive
+      ? value === matcher.exact
+      : value.toLocaleLowerCase("und") === matcher.exact.toLocaleLowerCase("und");
   }
   if (matcher.normalizedExact !== undefined) {
     const expected = normalizeText(matcher.normalizedExact);
@@ -122,6 +123,11 @@ function evaluate(
     checks.push([matchesIndex(layout.columnIndex, selector.columnIndex), "columnIndex"]);
   if (selector.blockIndex !== undefined)
     checks.push([matchesIndex(layout.blockIndex, selector.blockIndex), "blockIndex"]);
+  if (selector.dimensionsSimilarToPeers !== undefined)
+    checks.push([
+      layout.dimensionsSimilarToPeers === selector.dimensionsSimilarToPeers,
+      "dimensionsSimilarToPeers",
+    ]);
   if (selector.siblingIndex !== undefined)
     checks.push([matchesIndex(node.siblingIndex, selector.siblingIndex), "siblingIndex"]);
   if (selector.all)

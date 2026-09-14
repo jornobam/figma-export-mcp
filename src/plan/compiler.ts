@@ -199,6 +199,23 @@ function orderMatches(matches: Match[], input: CreateExportPlanInput): Match[] {
   const directionY = input.ordering.rowDirection === "top-to-bottom" ? 1 : -1;
   const directionX = input.ordering.itemDirection === "left-to-right" ? 1 : -1;
   const custom = new Map((input.ordering.customNodeIds ?? []).map((id, index) => [id, index]));
+  const maxColumnByRow = new Map<number, number>();
+  for (const match of matches) {
+    const row = match.layout.rowIndex;
+    const column = match.layout.columnIndex;
+    if (row !== undefined && column !== undefined)
+      maxColumnByRow.set(row, Math.max(maxColumnByRow.get(row) ?? 0, column));
+  }
+  const positionRank = (match: Match): number => {
+    const column = match.layout.columnIndex;
+    const row = match.layout.rowIndex;
+    const priorities = input.ordering.positionPriority ?? [];
+    for (const [index, value] of priorities.entries()) {
+      if (typeof value === "number" && value === column) return index;
+      if (value === "last" && row !== undefined && column === maxColumnByRow.get(row)) return index;
+    }
+    return Number.MAX_SAFE_INTEGER;
+  };
   return [...matches].sort((a, b) => {
     let result = 0;
     switch (input.ordering.mode) {
@@ -228,13 +245,8 @@ function orderMatches(matches: Match[], input: CreateExportPlanInput): Match[] {
         );
         break;
       case "position": {
-        const priority = new Map(
-          (input.ordering.positionPriority ?? []).map((value, index) => [String(value), index]),
-        );
         result =
-          (priority.get(String(a.layout.columnIndex)) ?? Number.MAX_SAFE_INTEGER) -
-            (priority.get(String(b.layout.columnIndex)) ?? Number.MAX_SAFE_INTEGER) ||
-          (a.layout.rowIndex ?? 0) - (b.layout.rowIndex ?? 0);
+          positionRank(a) - positionRank(b) || (a.layout.rowIndex ?? 0) - (b.layout.rowIndex ?? 0);
         break;
       }
       case "hierarchy":

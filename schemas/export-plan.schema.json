@@ -144,13 +144,45 @@
         "section": { "$ref": "#/$defs/stringMatcher" },
         "hierarchyPath": { "$ref": "#/$defs/stringMatcher" },
         "componentName": { "$ref": "#/$defs/stringMatcher" },
+        "componentProperties": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/stringMatcher" }
+        },
         "visible": { "type": "boolean" },
+        "width": { "$ref": "#/$defs/numberRange" },
+        "height": { "$ref": "#/$defs/numberRange" },
+        "aspectRatio": { "$ref": "#/$defs/numberRange" },
+        "rowIndex": { "$ref": "#/$defs/indexMatcher" },
+        "columnIndex": { "$ref": "#/$defs/indexMatcher" },
+        "blockIndex": { "$ref": "#/$defs/indexMatcher" },
+        "siblingIndex": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "array", "items": { "type": "integer", "minimum": 0 }, "minItems": 1 }
+          ]
+        },
+        "dimensionsSimilarToPeers": { "type": "boolean" },
         "includeIds": { "type": "array", "items": { "type": "string" } },
         "excludeIds": { "type": "array", "items": { "type": "string" } },
         "all": { "type": "array", "items": { "$ref": "#/$defs/selector" } },
         "any": { "type": "array", "items": { "$ref": "#/$defs/selector" } },
         "not": { "$ref": "#/$defs/selector" }
       }
+    },
+    "numberRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "min": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "indexMatcher": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1 }
+      ]
     }
   }
 }

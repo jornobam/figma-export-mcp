@@ -47,7 +47,7 @@ export type LayoutAnalysis = {
 
 export function analyzeGeometry(
   nodes: NormalizedNode[],
-  options: { toleranceFactor?: number; global?: boolean } = {},
+  options: { toleranceFactor?: number; dimensionToleranceFactor?: number; global?: boolean } = {},
 ): LayoutAnalysis {
   const bounded = nodes.filter((node) => node.bounds && node.visible);
   const factor = options.toleranceFactor ?? 0.35;
@@ -60,7 +60,43 @@ export function analyzeGeometry(
   }
   const rowClusters: Cluster[] = [];
   const columnClusters: Cluster[] = [];
-  for (const partition of partitions.values()) {
+  const layout = new Map<string, LayoutInfo>();
+  const dimensionToleranceFactor = options.dimensionToleranceFactor ?? 0.15;
+  const orderedPartitions = [...partitions.entries()].sort(([, a], [, b]) => {
+    const firstA = [...a].sort(
+      (left, right) =>
+        (left.bounds?.y ?? 0) - (right.bounds?.y ?? 0) ||
+        (left.bounds?.x ?? 0) - (right.bounds?.x ?? 0) ||
+        left.id.localeCompare(right.id, "en"),
+    )[0];
+    const firstB = [...b].sort(
+      (left, right) =>
+        (left.bounds?.y ?? 0) - (right.bounds?.y ?? 0) ||
+        (left.bounds?.x ?? 0) - (right.bounds?.x ?? 0) ||
+        left.id.localeCompare(right.id, "en"),
+    )[0];
+    return (
+      (firstA?.bounds?.y ?? 0) - (firstB?.bounds?.y ?? 0) ||
+      (firstA?.bounds?.x ?? 0) - (firstB?.bounds?.x ?? 0) ||
+      (firstA?.id ?? "").localeCompare(firstB?.id ?? "", "en")
+    );
+  });
+  for (const [blockOffset, [, partition]] of orderedPartitions.entries()) {
+    const medianWidth = median(partition.map((node) => node.bounds?.width ?? 0));
+    const medianHeight = median(partition.map((node) => node.bounds?.height ?? 0));
+    for (const node of partition) {
+      const width = node.bounds?.width ?? 0;
+      const height = node.bounds?.height ?? 0;
+      const similar =
+        partition.length > 1 &&
+        Math.abs(width - medianWidth) <= Math.max(1, medianWidth * dimensionToleranceFactor) &&
+        Math.abs(height - medianHeight) <= Math.max(1, medianHeight * dimensionToleranceFactor);
+      layout.set(node.id, {
+        blockIndex: blockOffset + 1,
+        groupKey: node.parentId ?? node.section ?? node.page ?? "root",
+        dimensionsSimilarToPeers: similar,
+      });
+    }
     rowClusters.push(...cluster(partition, "y", toleranceY));
     columnClusters.push(...cluster(partition, "x", toleranceX));
   }
@@ -72,7 +108,6 @@ export function analyzeGeometry(
     (a, b) =>
       a.center - b.center || (a.nodes[0]?.id ?? "").localeCompare(b.nodes[0]?.id ?? "", "en"),
   );
-  const layout = new Map<string, LayoutInfo>();
   const rows = rowClusters.map((row, rowOffset) => {
     const ordered = [...row.nodes].sort(
       (a, b) => (a.bounds?.x ?? 0) - (b.bounds?.x ?? 0) || a.id.localeCompare(b.id, "en"),

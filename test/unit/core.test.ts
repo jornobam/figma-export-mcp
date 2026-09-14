@@ -5,11 +5,13 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config.js";
 import { CreateExportPlanInputSchema } from "../../src/domain/schemas.js";
 import type { Match } from "../../src/domain/types.js";
+import type { FigmaClient } from "../../src/figma/client.js";
 import { normalizeFigmaFile } from "../../src/figma/snapshot.js";
 import { normalizeNodeId, parseFigmaReference } from "../../src/figma/url.js";
+import { JobOrchestrator } from "../../src/jobs/orchestrator.js";
 import { createZip } from "../../src/packaging/zip.js";
-import { compileExportPlan, selectedByPositions } from "../../src/plan/compiler.js";
-import { querySnapshot, safeRegex } from "../../src/selection/engine.js";
+import { compileExportPlan, orderMatches, selectedByPositions } from "../../src/plan/compiler.js";
+import { matchesString, querySnapshot, safeRegex } from "../../src/selection/engine.js";
 import { analyzeGeometry } from "../../src/selection/geometry.js";
 import { StateStore } from "../../src/state/store.js";
 import {
@@ -19,6 +21,7 @@ import {
   sanitizeSegment,
   sha256,
 } from "../../src/util.js";
+import type { YandexDiskClient } from "../../src/yandex/client.js";
 
 function fixture() {
   const card = (id: string, x: number, y: number, name: string, text: string, visible = true) => ({
@@ -127,6 +130,12 @@ describe("Figma URL and safe path primitives", () => {
 });
 
 describe("universal selector and geometry engine", () => {
+  it("matches exact strings correctly in both case modes", () => {
+    expect(matchesString("RAL 6021", { exact: "ral 6021", caseSensitive: false })).toBe(true);
+    expect(matchesString("RAL 6021", { exact: "ral 6021", caseSensitive: true })).toBe(false);
+    expect(matchesString(" RAL 6021 ", { exact: "RAL 6021", caseSensitive: false })).toBe(false);
+  });
+
   it("supports descendant text, logical selectors, visibility and nearest ancestor", () => {
     const snapshot = fixture();
     const result = querySnapshot(
@@ -153,6 +162,20 @@ describe("universal selector and geometry engine", () => {
     expect(result.rows.length).toBeGreaterThanOrEqual(2);
     expect(result.toleranceY).toBeGreaterThan(1);
     expect(result.warnings.some((warning) => warning.includes("unequal"))).toBe(true);
+    expect(result.layout.get("3:1")?.blockIndex).toBe(1);
+    expect(result.layout.get("4:1")?.blockIndex).toBe(2);
+    expect(result.layout.get("3:1")?.dimensionsSimilarToPeers).toBe(true);
+    expect(result.layout.get("4:1")?.dimensionsSimilarToPeers).toBe(false);
+  });
+
+  it("evaluates blockIndex and dimensionsSimilarToPeers selectors", () => {
+    const snapshot = fixture();
+    const result = querySnapshot(snapshot, {
+      type: { in: ["FRAME"] },
+      blockIndex: 1,
+      dimensionsSimilarToPeers: true,
+    });
+    expect(result.matches.map((match) => match.exportNode.id)).toEqual(["3:1", "3:2"]);
   });
 
   it("rejects unsafe regex constructs", () => {
@@ -198,6 +221,122 @@ describe("universal selector and geometry engine", () => {
       [],
     );
     expect(selected.map((match) => match.exportNode.id)).toEqual(["r2c1", "r2c2", "r2c3"]);
+  });
+
+  it("resolves positionPriority last separately for unequal rows", () => {
+    const matches = [
+      layoutMatch("r1c1", 1, 1),
+      layoutMatch("r1c2", 1, 2),
+      layoutMatch("r1c3", 1, 3),
+      layoutMatch("r2c1", 2, 1),
+      layoutMatch("r2c2", 2, 2),
+    ];
+    const input = CreateExportPlanInputSchema.parse({
+      snapshot_id: "snap_fixture",
+      selection: { type: { in: ["FRAME"] } },
+      ordering: { mode: "position", positionPriority: ["last", 1] },
+      destination: { job_folder: "Test" },
+    });
+    expect(orderMatches(matches, input).map((match) => match.exportNode.id)).toEqual([
+      "r1c3",
+      "r2c2",
+      "r1c1",
+      "r2c1",
+      "r1c2",
+    ]);
+  });
+});
+
+describe("safe Yandex collision handling", () => {
+  it("preflights collision_policy error before rendering or creating a job", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "figma-export-preflight-"));
+    try {
+      const store = new StateStore(root);
+      await store.initialize();
+      const snapshot = fixture();
+      const input = CreateExportPlanInputSchema.parse({
+        snapshot_id: snapshot.id,
+        selection: { id: "3:1" },
+        ordering: { mode: "row-major" },
+        destination: { root: "/AI Exports", job_folder: "Collision" },
+        collision_policy: "error",
+      });
+      const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
+      plan.status = "confirmed";
+      let renderCalls = 0;
+      const figma = {
+        getCurrentVersion: async () => "42",
+        renderImages: async () => {
+          renderCalls += 1;
+          return {};
+        },
+      } as unknown as FigmaClient;
+      const yandex = {
+        getMetadata: async () => ({ type: "file", size: 3 }),
+      } as unknown as YandexDiskClient;
+      const jobs = new JobOrchestrator(
+        loadConfig({ FIGMA_EXPORT_STATE_DIR: root }),
+        store,
+        figma,
+        yandex,
+      );
+      await expect(jobs.execute(plan, plan.digest, "preflight-1")).rejects.toThrow(
+        /destination path.*already exist/iu,
+      );
+      expect(renderCalls).toBe(0);
+      expect(await store.listJobs()).toHaveLength(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("never treats same-size remote data without a checksum as identical", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "figma-export-checksum-"));
+    try {
+      const store = new StateStore(root);
+      await store.initialize();
+      const snapshot = fixture();
+      const input = CreateExportPlanInputSchema.parse({
+        snapshot_id: snapshot.id,
+        selection: { id: "3:1" },
+        ordering: { mode: "row-major" },
+        destination: { root: "/AI Exports", job_folder: "Checksum" },
+        collision_policy: "skip_identical",
+      });
+      const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
+      plan.status = "confirmed";
+      await store.savePlan(plan);
+      let uploadCalls = 0;
+      const figma = {
+        getCurrentVersion: async () => "42",
+        renderImages: async (_fileKey: string, ids: string[]) =>
+          Object.fromEntries(ids.map((id) => [id, `https://example.com/${id}`])),
+        downloadRendered: async () => new TextEncoder().encode("abc"),
+      } as unknown as FigmaClient;
+      const yandex = {
+        getMetadata: async (remotePath: string) => ({
+          type: "file",
+          size: 3,
+          path: `disk:${remotePath}`,
+        }),
+        upload: async () => {
+          uploadCalls += 1;
+        },
+      } as unknown as YandexDiskClient;
+      const jobs = new JobOrchestrator(
+        loadConfig({ FIGMA_EXPORT_STATE_DIR: root }),
+        store,
+        figma,
+        yandex,
+      );
+      const job = await jobs.execute(plan, plan.digest, "checksum-1");
+      await jobs.wait(job.id);
+      const finished = await store.getJob(job.id);
+      expect(finished.items[0]?.error?.code).toBe("YANDEX_CHECKSUM_UNAVAILABLE");
+      expect(uploadCalls).toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
 

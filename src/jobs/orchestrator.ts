@@ -45,6 +45,69 @@ export class JobOrchestrator {
     await this.store.saveJob(job);
   }
 
+  private expectedRemotePaths(plan: ExportPlan, input: CreateExportPlanInput): string[] {
+    const paths: string[] = [];
+    if (input.packaging.mode === "folders" || input.packaging.mode === "filesAndZip")
+      paths.push(...plan.manifest.map((item) => item.remotePath));
+    if (input.packaging.mode !== "folders") {
+      const effectiveJobFolder = resolveJobFolder(
+        input.destination.job_folder,
+        input.collision_policy,
+        plan.source.version,
+        input.naming.max_segment_length,
+      );
+      if (input.packaging.mode === "zipPerGroup") {
+        const keys = new Set(
+          plan.manifest.map(
+            (item) =>
+              input.packaging.archive_groups_by
+                .map((name) => item.variables[name] ?? `_missing_${name}`)
+                .join("__") || "group",
+          ),
+        );
+        for (const key of keys)
+          paths.push(
+            joinRemotePath(
+              input.destination.root,
+              effectiveJobFolder,
+              `${sanitizeSegment(key)}.zip`,
+            ),
+          );
+      } else {
+        paths.push(
+          joinRemotePath(
+            input.destination.root,
+            effectiveJobFolder,
+            `${sanitizeSegment(input.destination.job_folder)}.zip`,
+          ),
+        );
+      }
+    }
+    return [...new Set(paths)];
+  }
+
+  private async preflightDestinations(
+    plan: ExportPlan,
+    input: CreateExportPlanInput,
+  ): Promise<void> {
+    if (input.collision_policy !== "error") return;
+    const paths = this.expectedRemotePaths(plan, input);
+    const existing = (
+      await mapLimit(paths, this.config.concurrency, async (remotePath) => ({
+        remotePath,
+        metadata: await this.yandex.getMetadata(remotePath),
+      }))
+    ).filter((entry) => entry.metadata !== null);
+    if (existing.length)
+      throw appError(
+        "YANDEX_DESTINATION_COLLISION",
+        "preflight",
+        `${existing.length} destination path(s) already exist; export was not started`,
+        false,
+        { collisionCount: existing.length },
+      );
+  }
+
   async execute(plan: ExportPlan, digest: string, idempotencyKey: string): Promise<ExportJob> {
     if (plan.digest !== digest)
       throw appError("PLAN_DIGEST_MISMATCH", "execution", "Plan digest does not match");
@@ -77,6 +140,8 @@ export class JobOrchestrator {
         "Figma file changed after preview; create and confirm a new plan",
       );
     }
+    const input = plan.input as unknown as CreateExportPlanInput;
+    await this.preflightDestinations(plan, input);
     const now = new Date().toISOString();
     const id = makeId("job");
     const job: ExportJob = {
@@ -195,10 +260,12 @@ export class JobOrchestrator {
     const existing = await this.yandex.getMetadata(item.remotePath);
     if (existing) {
       const canTreatAsOwnUpload = item.uploadAttempted === true;
+      const checksumAvailable = Boolean(existing.sha256);
       const identical =
         existing.type === "file" &&
         existing.size === item.localSize &&
-        (!existing.sha256 || `sha256:${existing.sha256}` === item.localSha256);
+        checksumAvailable &&
+        `sha256:${existing.sha256?.toLowerCase()}` === item.localSha256.toLowerCase();
       if (identical && (canTreatAsOwnUpload || input.collision_policy === "skip_identical")) {
         await this.yandex.verify(item.remotePath, {
           size: item.localSize,
@@ -207,6 +274,17 @@ export class JobOrchestrator {
         item.stage = "verified";
         item.verifiedAt = new Date().toISOString();
         this.addEvent(job, "verified", "Verified existing identical remote file", item.id);
+      } else if (
+        existing.type === "file" &&
+        existing.size === item.localSize &&
+        !checksumAvailable &&
+        (canTreatAsOwnUpload || input.collision_policy === "skip_identical")
+      ) {
+        throw appError(
+          "YANDEX_CHECKSUM_UNAVAILABLE",
+          "verification",
+          "Remote checksum is unavailable; size alone is insufficient to skip an existing file",
+        );
       } else {
         throw appError(
           "YANDEX_DESTINATION_COLLISION",

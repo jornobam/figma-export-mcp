@@ -2,7 +2,7 @@ import type { AppConfig } from "../config.js";
 import type { FetchLike } from "../domain/types.js";
 import { AppError, appError } from "../errors.js";
 import { assertSafeExternalUrl } from "../security.js";
-import { joinRemotePath, parseRetryAfter, sleep } from "../util.js";
+import { joinRemotePath, parseRetryAfter, sha256, sleep } from "../util.js";
 
 export type YandexResource = {
   name?: string;
@@ -181,7 +181,13 @@ export class YandexDiskClient {
       clearTimeout(timeout);
       if (error instanceof AppError) throw error;
       const remote = await this.getMetadata(remotePath).catch(() => null);
-      if (remote?.type === "file" && remote.size === bytes.byteLength) return;
+      if (
+        remote?.type === "file" &&
+        remote.size === bytes.byteLength &&
+        remote.sha256 &&
+        `sha256:${remote.sha256.toLowerCase()}` === sha256(bytes).toLowerCase()
+      )
+        return;
       throw new AppError(
         {
           code: "YANDEX_UPLOAD_AMBIGUOUS",
