@@ -126,8 +126,22 @@ export async function createZipFile(
     const source = await stat(entry.path);
     if (!source.isFile())
       throw appError("ZIP_SOURCE_INVALID", "packaging", "ZIP source is not a regular file");
-    return { name: safeEntryName(entry.name), path: entry.path };
+    return { name: safeEntryName(entry.name), path: entry.path, size: source.size };
   });
+  // STORE archives have a predictable upper bound. Reject impossible budgets before opening
+  // streams; this is also important on Windows, where an in-flight source handle cannot be
+  // safely removed while an over-limit ZIP writer is unwinding.
+  const upperBound = prepared.reduce(
+    (total, entry) => total + entry.size + 256 + Buffer.byteLength(entry.name, "utf8") * 2,
+    256,
+  );
+  if (upperBound > maxBytes) {
+    throw appError(
+      "TEMP_LIMIT_EXCEEDED",
+      "packaging",
+      "Archive exceeds the configured temporary storage limit",
+    );
+  }
   await mkdir(path.dirname(destination), { recursive: true });
   const digest = createHash("sha256");
   let size = 0;
