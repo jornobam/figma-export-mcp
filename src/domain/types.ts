@@ -109,6 +109,15 @@ export type ManifestItem = {
   confidence: number;
 };
 
+export type ArchiveManifestItem = {
+  id: string;
+  ordinal: number;
+  groupKey: string;
+  groupLabel: string;
+  remotePath: string;
+  entries: Array<{ itemId: string; name: string }>;
+};
+
 export type ExportPlanStatus =
   | "draft"
   | "confirmed"
@@ -127,6 +136,7 @@ export type ExportPlan = {
   source: { fileKey: string; version: string };
   input: Record<string, unknown>;
   manifest: ManifestItem[];
+  archiveManifest: ArchiveManifestItem[];
   warnings: string[];
   clarifications: Clarification[];
   collisions: Array<{ path: string; itemIds: string[] }>;

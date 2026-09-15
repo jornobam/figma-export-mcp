@@ -67,6 +67,12 @@ FIGMA_TOKEN=... YANDEX_DISK_TOKEN=... npm start
 
 На Windows используйте `$env:FIGMA_TOKEN="..."; npm start`, на PowerShell; на macOS/Linux — `export FIGMA_TOKEN=...`. Полный перечень переменных находится в `.env.example`. По умолчанию состояние хранится в `%LOCALAPPDATA%/FigmaExportMCP/state`, `~/Library/Application Support/figma-export-mcp` или `$XDG_STATE_HOME/figma-export-mcp`.
 
+По умолчанию `FIGMA_AUTH_MODE=pat` и `FIGMA_TOKEN` передаётся Figma через `X-Figma-Token`.
+Для уже полученного OAuth access token установите `FIGMA_AUTH_MODE=oauth` и
+`FIGMA_OAUTH_ACCESS_TOKEN`; запросы используют `Authorization: Bearer`. Регистрация OAuth app,
+браузерное согласие и обновление токена выполняются вне этого STDIO-сервера. План показывает
+изображения и все ZIP-архивы с точными путями; коллизии между ними блокируют подтверждение.
+
 ### Подключение MCP-клиента
 
 Готовый пример конфигурации Codex находится в `examples/codex-mcp.json`. Для Claude Desktop, Cursor и других клиентов используется тот же STDIO command: `node /absolute/path/dist/stdio.js`; секреты передаются только через `env`.

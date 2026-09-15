@@ -7,15 +7,9 @@ import type { ExportJob, ExportPlan, JobItem } from "../domain/types.js";
 import { AppError, appError, toSafeError } from "../errors.js";
 import type { FigmaClient } from "../figma/client.js";
 import { createZipFile } from "../packaging/zip.js";
+import { isPlanDigestValid } from "../plan/compiler.js";
 import type { StateStore } from "../state/store.js";
-import {
-  assertInside,
-  joinRemotePath,
-  makeId,
-  mapLimit,
-  resolveJobFolder,
-  sanitizeSegment,
-} from "../util.js";
+import { assertInside, ensureCaseInsensitiveUnique, makeId, mapLimit } from "../util.js";
 import type { YandexDiskClient } from "../yandex/client.js";
 
 export class JobOrchestrator {
@@ -45,57 +39,28 @@ export class JobOrchestrator {
     await this.store.saveJob(job);
   }
 
-  private expectedRemotePaths(plan: ExportPlan, input: CreateExportPlanInput): string[] {
-    const paths: string[] = [];
-    if (input.packaging.mode === "folders" || input.packaging.mode === "filesAndZip")
-      paths.push(...plan.manifest.map((item) => item.remotePath));
-    if (input.packaging.mode !== "folders") {
-      const effectiveJobFolder = resolveJobFolder(
-        input.destination.job_folder,
-        input.collision_policy,
-        plan.source.version,
-        input.naming.max_segment_length,
-      );
-      if (input.packaging.mode === "zipPerGroup") {
-        const keys = new Set(
-          plan.manifest.map(
-            (item) =>
-              input.packaging.archive_groups_by
-                .map((name) => item.variables[name] ?? `_missing_${name}`)
-                .join("__") || "group",
-          ),
-        );
-        for (const key of keys)
-          paths.push(
-            joinRemotePath(
-              input.destination.root,
-              effectiveJobFolder,
-              `${sanitizeSegment(key, input.naming.max_segment_length, input.naming.whitespace)}.zip`,
-            ),
-          );
-      } else {
-        paths.push(
-          joinRemotePath(
-            input.destination.root,
-            effectiveJobFolder,
-            `${sanitizeSegment(
-              input.destination.job_folder,
-              input.naming.max_segment_length,
-              input.naming.whitespace,
-            )}.zip`,
-          ),
-        );
-      }
-    }
-    return [...new Set(paths)];
-  }
-
   private async preflightDestinations(
     plan: ExportPlan,
     input: CreateExportPlanInput,
   ): Promise<void> {
+    const allOutputPaths = [
+      ...plan.manifest.map((item) => item.remotePath),
+      ...plan.archiveManifest.map((item) => item.remotePath),
+    ];
+    if (ensureCaseInsensitiveUnique(allOutputPaths).length) {
+      throw appError(
+        "PLAN_PATH_COLLISION",
+        "preflight",
+        "Planned image and archive paths collide; create a new plan",
+      );
+    }
     if (input.collision_policy !== "error") return;
-    const paths = this.expectedRemotePaths(plan, input);
+    const paths = [
+      ...(input.packaging.mode === "folders" || input.packaging.mode === "filesAndZip"
+        ? plan.manifest.map((item) => item.remotePath)
+        : []),
+      ...plan.archiveManifest.map((item) => item.remotePath),
+    ];
     const existing = (
       await mapLimit(paths, this.config.concurrency, async (remotePath) => ({
         remotePath,
@@ -115,6 +80,12 @@ export class JobOrchestrator {
   async execute(plan: ExportPlan, digest: string, idempotencyKey: string): Promise<ExportJob> {
     if (plan.digest !== digest)
       throw appError("PLAN_DIGEST_MISMATCH", "execution", "Plan digest does not match");
+    if (!isPlanDigestValid(plan))
+      throw appError(
+        "PLAN_DIGEST_CORRUPT",
+        "execution",
+        "Stored plan outputs no longer match the confirmed digest; create a new plan",
+      );
     if (plan.status !== "confirmed")
       throw appError("PLAN_NOT_CONFIRMED", "execution", "Only a confirmed plan can be executed");
     const existing = (await this.store.listJobs()).find(
@@ -145,6 +116,17 @@ export class JobOrchestrator {
       );
     }
     const input = plan.input as unknown as CreateExportPlanInput;
+    if (
+      input.packaging.mode !== "folders" &&
+      plan.manifest.length > 0 &&
+      plan.archiveManifest.length === 0
+    ) {
+      throw appError(
+        "PLAN_REPREVIEW_REQUIRED",
+        "execution",
+        "This ZIP plan predates archive path materialization; create and confirm a new plan",
+      );
+    }
     await this.preflightDestinations(plan, input);
     const now = new Date().toISOString();
     const id = makeId("job");
@@ -328,62 +310,39 @@ export class JobOrchestrator {
     await this.save(job);
   }
 
-  private async prepareArchives(
-    job: ExportJob,
-    input: CreateExportPlanInput,
-    sourceVersion: string,
-  ): Promise<void> {
+  private async prepareArchives(job: ExportJob, plan: ExportPlan): Promise<void> {
+    const input = plan.input as unknown as CreateExportPlanInput;
     if (input.packaging.mode === "folders") return;
     const sources = job.items.filter((item) => item.kind !== "archive");
     if (sources.some((item) => item.stage === "failed" || !item.localRelativePath)) return;
-    const groups = new Map<string, JobItem[]>();
-    if (input.packaging.mode === "zipPerGroup") {
-      for (const item of sources) {
-        const key =
-          input.packaging.archive_groups_by
-            .map((name) => item.variables[name] ?? `_missing_${name}`)
-            .join("__") || "group";
-        groups.set(key, [...(groups.get(key) ?? []), item]);
+    const sourcesById = new Map(sources.map((item) => [item.id, item]));
+    for (const archive of plan.archiveManifest) {
+      const items = archive.entries.map((entry) => sourcesById.get(entry.itemId));
+      if (items.some((item) => !item)) {
+        throw appError(
+          "PLAN_ARCHIVE_SOURCE_MISSING",
+          "packaging",
+          "Archive refers to a source item absent from the confirmed plan",
+        );
       }
-    } else {
-      groups.set("archive", sources);
-    }
-    const effectiveJobFolder = resolveJobFolder(
-      input.destination.job_folder,
-      input.collision_policy,
-      sourceVersion,
-      input.naming.max_segment_length,
-    );
-    for (const [key, items] of groups) {
-      const commonPrefix = joinRemotePath(input.destination.root, effectiveJobFolder);
-      const entries = items.map((item) => ({
-        name: item.remotePath.startsWith(`${commonPrefix}/`)
-          ? item.remotePath.slice(commonPrefix.length + 1)
-          : path.posix.basename(item.remotePath),
-        path: this.localPath(job, item),
+      const entries = archive.entries.map((entry) => ({
+        name: entry.name,
+        path: this.localPath(job, sourcesById.get(entry.itemId) as JobItem),
       }));
-      const archiveName =
-        input.packaging.mode === "zipPerGroup"
-          ? `${sanitizeSegment(key, input.naming.max_segment_length, input.naming.whitespace)}.zip`
-          : `${sanitizeSegment(
-              input.destination.job_folder,
-              input.naming.max_segment_length,
-              input.naming.whitespace,
-            )}.zip`;
-      let archiveItem = job.items.find((item) => item.nodeId === `archive:${key}`);
+      let archiveItem = job.items.find((item) => item.id === archive.id);
       if (!archiveItem) {
         archiveItem = {
-          id: makeId("item"),
-          ordinal: job.items.length + 1,
-          nodeId: `archive:${key}`,
-          matchedNodeId: `archive:${key}`,
-          hierarchyPath: ["archive", key],
-          variables: { archive_group: key, ext: "zip" },
-          remotePath: joinRemotePath(input.destination.root, effectiveJobFolder, archiveName),
+          id: archive.id,
+          ordinal: archive.ordinal,
+          nodeId: `archive:${archive.id}`,
+          matchedNodeId: `archive:${archive.id}`,
+          hierarchyPath: ["archive", archive.groupLabel],
+          variables: { archive_group: archive.groupLabel, ext: "zip" },
+          remotePath: archive.remotePath,
           reasons: ["packaging"],
           confidence: 1,
           kind: "archive",
-          archiveSourceItemIds: items.map((item) => item.id),
+          archiveSourceItemIds: archive.entries.map((entry) => entry.itemId),
           stage: "planned",
           attempts: 0,
         };
@@ -436,7 +395,7 @@ export class JobOrchestrator {
       this.addEvent(
         job,
         "packaging",
-        `Created archive containing ${items.length} entries`,
+        `Created archive containing ${archive.entries.length} entries`,
         archiveItem.id,
       );
     }
@@ -447,6 +406,21 @@ export class JobOrchestrator {
     const job = await this.store.getJob(jobId);
     const plan = await this.store.getPlan(job.planId);
     const input = plan.input as unknown as CreateExportPlanInput;
+    if (
+      input.packaging.mode !== "folders" &&
+      plan.manifest.length > 0 &&
+      plan.archiveManifest.length === 0
+    ) {
+      job.status = "partial";
+      plan.status = "partial";
+      this.addEvent(
+        job,
+        "failed",
+        "Legacy ZIP plan has no confirmed archive manifest; local recovery data was preserved",
+      );
+      await Promise.all([this.save(job), this.store.savePlan(plan)]);
+      return;
+    }
     job.status = "running";
     this.addEvent(job, "running", "Job started or resumed");
     await this.save(job);
@@ -506,7 +480,7 @@ export class JobOrchestrator {
         }
       });
     }
-    await this.prepareArchives(job, input, plan.source.version);
+    await this.prepareArchives(job, plan);
     const uploadSources =
       input.packaging.mode === "folders" || input.packaging.mode === "filesAndZip";
     const deliverable = job.items.filter(

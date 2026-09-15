@@ -21,6 +21,12 @@ Drafts contain canonical plan input plus a fully materialized manifest. A SHA-25
 every execution-relevant field, source version, warnings, clarifications, and manifest item. A plan
 is never edited: changed inputs create a new plan ID and digest. Confirmation stores the digest.
 
+Archives have their own materialized manifest with immutable paths, group identities, source-item
+references, and ZIP entry names. Preview paginates source entries and archives together. Collision
+checking covers all planned paths, including source/archive and archive/archive pairs, before a
+plan can be confirmed. Execution and destination preflight consume these manifest paths directly;
+neither recomputes archive names or deduplicates them with a `Set`.
+
 ## 2026-09-14 — Local download before Yandex upload
 
 Rendered bytes are downloaded into a job workspace, hashed, atomically committed, then uploaded.
@@ -53,6 +59,14 @@ shift their parents' indexes. Position selection keys groups by both block ident
 Connection readiness validates local token configuration without calling `/v1/me`. Network access
 is proven by `inspect_figma_file`, which uses the file endpoint and therefore needs only
 `file_content:read`; `current_user:read` is not required.
+
+## 2026-09-15 — Explicit Figma PAT and OAuth modes
+
+Figma PAT and plan-access tokens use `X-Figma-Token`; OAuth access tokens use
+`Authorization: Bearer`, as documented by Figma. `FIGMA_AUTH_MODE` selects `pat` or `oauth`
+without guessing from a token prefix, and OAuth mode reads `FIGMA_OAUTH_ACCESS_TOKEN` only.
+The OAuth authorization/refresh lifecycle remains the responsibility of the external Figma OAuth
+app or secret manager; this STDIO server never asks for client secrets or a browser callback.
 
 ## Verified official API facts
 

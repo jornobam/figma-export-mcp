@@ -21,9 +21,19 @@ export class FigmaClient {
 
   private requireToken(): string {
     if (!this.config.figmaToken) {
-      throw appError("FIGMA_NOT_CONFIGURED", "connection", "FIGMA_TOKEN is not configured");
+      throw appError(
+        "FIGMA_NOT_CONFIGURED",
+        "connection",
+        `${this.config.figmaAuthMode === "oauth" ? "FIGMA_OAUTH_ACCESS_TOKEN" : "FIGMA_TOKEN"} is not configured`,
+      );
     }
     return this.config.figmaToken;
+  }
+
+  private authHeaders(token: string): Record<string, string> {
+    return this.config.figmaAuthMode === "oauth"
+      ? { Authorization: `Bearer ${token}` }
+      : { "X-Figma-Token": token };
   }
 
   private async requestJson<T>(path: string, init: RequestInit = {}, maxRetries = 4): Promise<T> {
@@ -37,7 +47,7 @@ export class FigmaClient {
           ...init,
           redirect: "manual",
           signal: controller.signal,
-          headers: { Accept: "application/json", "X-Figma-Token": token, ...init.headers },
+          headers: { Accept: "application/json", ...this.authHeaders(token), ...init.headers },
         });
       } catch (error) {
         clearTimeout(timeout);

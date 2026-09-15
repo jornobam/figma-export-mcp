@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config.js";
 import { CreateExportPlanInputSchema } from "../../src/domain/schemas.js";
@@ -9,10 +10,18 @@ import { FigmaClient } from "../../src/figma/client.js";
 import { normalizeFigmaFile } from "../../src/figma/snapshot.js";
 import { normalizeNodeId, parseFigmaReference } from "../../src/figma/url.js";
 import { JobOrchestrator } from "../../src/jobs/orchestrator.js";
+import { createMcpServer, type Services } from "../../src/mcp/server.js";
 import { createZip, createZipFile } from "../../src/packaging/zip.js";
-import { compileExportPlan, orderMatches, selectedByPositions } from "../../src/plan/compiler.js";
+import {
+  compileExportPlan,
+  isPlanDigestValid,
+  orderMatches,
+  previewPlan,
+  selectedByPositions,
+} from "../../src/plan/compiler.js";
 import { matchesString, querySnapshot, safeRegex } from "../../src/selection/engine.js";
 import { analyzeGeometry } from "../../src/selection/geometry.js";
+import type { SnapshotService } from "../../src/snapshot-service.js";
 import { StateStore } from "../../src/state/store.js";
 import {
   canonicalJson,
@@ -311,9 +320,137 @@ describe("connection checks", () => {
     });
     expect(fetchCalls).toBe(0);
   });
+
+  it("uses mutually exclusive PAT and OAuth request headers", async () => {
+    const seen: Headers[] = [];
+    const mockFetch = async (_input: string | URL | Request, init?: RequestInit) => {
+      seen.push(new Headers(init?.headers));
+      return new Response(JSON.stringify({ name: "Fixture", version: "42", document: {} }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    const pat = new FigmaClient(
+      loadConfig({ FIGMA_AUTH_MODE: "pat", FIGMA_TOKEN: "pat_test" }),
+      mockFetch,
+    );
+    const oauth = new FigmaClient(
+      loadConfig({
+        FIGMA_AUTH_MODE: "oauth",
+        FIGMA_TOKEN: "ignored_pat",
+        FIGMA_OAUTH_ACCESS_TOKEN: "oauth_test",
+      }),
+      mockFetch,
+    );
+    await pat.getFile("abcdef123");
+    await oauth.getFile("abcdef123");
+    expect(seen[0]?.get("X-Figma-Token")).toBe("pat_test");
+    expect(seen[0]?.has("Authorization")).toBe(false);
+    expect(seen[1]?.get("Authorization")).toBe("Bearer oauth_test");
+    expect(seen[1]?.has("X-Figma-Token")).toBe(false);
+  });
 });
 
 describe("safe Yandex collision handling", () => {
+  it("blocks archive collisions through the actual MCP confirmation tool", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "figma-export-mcp-archive-confirm-"));
+    const store = new StateStore(root);
+    await store.initialize();
+    const snapshot = fixture();
+    const plan = compileExportPlan(
+      snapshot,
+      CreateExportPlanInputSchema.parse({
+        snapshot_id: snapshot.id,
+        selection: { id: "3:1" },
+        naming: { template: "Job.zip" },
+        destination: { root: "/AI Exports", job_folder: "Job" },
+        packaging: { mode: "filesAndZip" },
+      }),
+      "/AI Exports",
+      100,
+    );
+    await store.savePlan(plan);
+    const services = {
+      config: loadConfig({ FIGMA_EXPORT_STATE_DIR: root }),
+      store,
+      figma: { getCurrentVersion: async () => "42" } as unknown as FigmaClient,
+      yandex: {} as YandexDiskClient,
+      snapshots: {} as SnapshotService,
+      jobs: {} as JobOrchestrator,
+    } satisfies Services;
+    const server = createMcpServer(services);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "archive-collision-test", version: "1.0.0" });
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const result = await client.callTool({
+        name: "confirm_export_plan",
+        arguments: {
+          plan_id: plan.id,
+          digest: plan.digest,
+          confirmation_summary: "Approve this exact export plan after preview",
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect((result.structuredContent as { error?: { code?: string } })?.error?.code).toBe(
+        "PLAN_HAS_UNRESOLVED_CLARIFICATIONS",
+      );
+      expect((await store.getPlan(plan.id)).status).toBe("draft");
+    } finally {
+      await client.close().catch(() => undefined);
+      await server.close().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a tampered confirmed plan with archive collisions before any export", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "figma-export-archive-collision-"));
+    try {
+      const store = new StateStore(root);
+      await store.initialize();
+      const snapshot = fixture();
+      const input = CreateExportPlanInputSchema.parse({
+        snapshot_id: snapshot.id,
+        selection: { id: "3:1" },
+        naming: { template: "Job.zip" },
+        destination: { root: "/AI Exports", job_folder: "Job" },
+        packaging: { mode: "filesAndZip" },
+      });
+      const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
+      plan.status = "confirmed";
+      let metadataCalls = 0;
+      let renderCalls = 0;
+      const figma = {
+        getCurrentVersion: async () => "42",
+        renderImages: async () => {
+          renderCalls += 1;
+          return {};
+        },
+      } as unknown as FigmaClient;
+      const yandex = {
+        getMetadata: async () => {
+          metadataCalls += 1;
+          return null;
+        },
+      } as unknown as YandexDiskClient;
+      const jobs = new JobOrchestrator(
+        loadConfig({ FIGMA_EXPORT_STATE_DIR: root }),
+        store,
+        figma,
+        yandex,
+      );
+      await expect(jobs.execute(plan, plan.digest, "archive-collision-1")).rejects.toThrow(
+        /image and archive paths collide/iu,
+      );
+      expect(metadataCalls).toBe(0);
+      expect(renderCalls).toBe(0);
+      expect(await store.listJobs()).toHaveLength(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("preflights collision_policy error before rendering or creating a job", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "figma-export-preflight-"));
     try {
@@ -455,6 +592,67 @@ describe("safe Yandex collision handling", () => {
 });
 
 describe("immutable plans, variables and ZIP", () => {
+  it("materializes filesAndZip image/archive path collisions before confirmation", () => {
+    const snapshot = fixture();
+    const input = CreateExportPlanInputSchema.parse({
+      snapshot_id: snapshot.id,
+      selection: { id: "3:1" },
+      naming: { template: "Job.zip" },
+      destination: { root: "/AI Exports", job_folder: "Job" },
+      packaging: { mode: "filesAndZip" },
+    });
+    const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
+    expect(plan.manifest[0]?.remotePath).toBe("/AI Exports/Job/Job.zip");
+    expect(plan.archiveManifest[0]?.remotePath).toBe(plan.manifest[0]?.remotePath);
+    expect(plan.collisions).toHaveLength(1);
+    expect(plan.collisions[0]?.itemIds).toEqual([
+      plan.manifest[0]?.id,
+      plan.archiveManifest[0]?.id,
+    ]);
+    expect(
+      plan.clarifications.some((item) => item.code === "PATH_COLLISIONS" && item.blocking),
+    ).toBe(true);
+    const preview = previewPlan(plan, 0, 10);
+    expect(preview.archive_count).toBe(1);
+    expect(preview.output_count).toBe(2);
+    expect((preview.manifest as Array<{ kind: string }>).map((item) => item.kind)).toEqual([
+      "source",
+      "archive",
+    ]);
+    expect(isPlanDigestValid(plan)).toBe(true);
+    if (plan.archiveManifest[0]) plan.archiveManifest[0].remotePath = "/AI Exports/Job/other.zip";
+    expect(isPlanDigestValid(plan)).toBe(false);
+  });
+
+  it("detects zipPerGroup archive collisions after safe-name sanitization", () => {
+    const snapshot = fixture();
+    const first = snapshot.nodes["3:1"];
+    const second = snapshot.nodes["3:2"];
+    if (!first || !second) throw new Error("fixture nodes missing");
+    first.name = "A:B";
+    second.name = "A?B";
+    const input = CreateExportPlanInputSchema.parse({
+      snapshot_id: snapshot.id,
+      selection: { id: ["3:1", "3:2"] },
+      variables: { group: { from: "name" } },
+      destination: { root: "/AI Exports", job_folder: "Job" },
+      packaging: { mode: "zipPerGroup", archive_groups_by: ["group"] },
+    });
+    const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
+    expect(plan.archiveManifest).toHaveLength(2);
+    expect(plan.archiveManifest.map((item) => item.remotePath)).toEqual([
+      "/AI Exports/Job/A_B.zip",
+      "/AI Exports/Job/A_B.zip",
+    ]);
+    expect(plan.archiveManifest[0]?.groupKey).not.toBe(plan.archiveManifest[1]?.groupKey);
+    expect(plan.collisions).toHaveLength(1);
+    expect(plan.collisions[0]?.itemIds).toEqual(plan.archiveManifest.map((item) => item.id));
+    const preview = previewPlan(plan, 2, 10);
+    expect((preview.manifest as Array<{ kind: string }>).map((item) => item.kind)).toEqual([
+      "archive",
+      "archive",
+    ]);
+  });
   it("extracts variables, positions, Unicode names and collisions before execution", () => {
     const snapshot = fixture();
     const input = CreateExportPlanInputSchema.parse({

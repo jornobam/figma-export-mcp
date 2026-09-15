@@ -4,6 +4,8 @@ import * as z from "zod/v4";
 
 const EnvSchema = z.object({
   FIGMA_TOKEN: z.string().optional(),
+  FIGMA_OAUTH_ACCESS_TOKEN: z.string().optional(),
+  FIGMA_AUTH_MODE: z.enum(["pat", "oauth"]).default("pat"),
   YANDEX_DISK_TOKEN: z.string().optional(),
   FIGMA_EXPORT_STATE_DIR: z.string().optional(),
   YANDEX_DISK_ROOT: z.string().default("/AI Exports"),
@@ -42,6 +44,7 @@ function defaultStateDir(platform = process.platform): string {
 
 export type AppConfig = {
   figmaToken?: string;
+  figmaAuthMode: "pat" | "oauth";
   yandexToken?: string;
   stateDir: string;
   yandexRoot: string;
@@ -58,8 +61,11 @@ export type AppConfig = {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = EnvSchema.parse(env);
+  const figmaToken =
+    parsed.FIGMA_AUTH_MODE === "oauth" ? parsed.FIGMA_OAUTH_ACCESS_TOKEN : parsed.FIGMA_TOKEN;
   return {
-    ...(parsed.FIGMA_TOKEN ? { figmaToken: parsed.FIGMA_TOKEN } : {}),
+    ...(figmaToken ? { figmaToken } : {}),
+    figmaAuthMode: parsed.FIGMA_AUTH_MODE,
     ...(parsed.YANDEX_DISK_TOKEN ? { yandexToken: parsed.YANDEX_DISK_TOKEN } : {}),
     stateDir: parsed.FIGMA_EXPORT_STATE_DIR || defaultStateDir(),
     yandexRoot: parsed.YANDEX_DISK_ROOT,

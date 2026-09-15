@@ -1,6 +1,7 @@
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import type { AppConfig } from "../config.js";
+import type { CreateExportPlanInput } from "../domain/schemas.js";
 import {
   AnalyzeInputSchema,
   CreateExportPlanInputSchema,
@@ -12,11 +13,11 @@ import type { SafeError } from "../domain/types.js";
 import { appError, toSafeError } from "../errors.js";
 import type { FigmaClient } from "../figma/client.js";
 import type { JobOrchestrator } from "../jobs/orchestrator.js";
-import { compileExportPlan, previewPlan } from "../plan/compiler.js";
+import { compileExportPlan, isPlanDigestValid, previewPlan } from "../plan/compiler.js";
 import { querySnapshot } from "../selection/engine.js";
 import type { SnapshotService } from "../snapshot-service.js";
 import type { StateStore } from "../state/store.js";
-import { makeCursor, parseCursor } from "../util.js";
+import { ensureCaseInsensitiveUnique, makeCursor, parseCursor } from "../util.js";
 import type { YandexDiskClient } from "../yandex/client.js";
 
 export const SERVER_INSTRUCTIONS = `Before any bulk export, inspect the Figma file, create a draft export plan, resolve every material ambiguity with the user, preview the exact count/order/naming/destination, and obtain explicit user confirmation. Never call confirm_export_plan or execute_export_plan based on assumptions. Figma is read-only. Upload to Yandex Disk, verify every object, and delete temporary files only after verification. Resume partial jobs instead of duplicating files.
@@ -118,6 +119,7 @@ export function createMcpServer(services: Services): McpServer {
         const warnings: string[] = [];
         const figma = {
           configured: Boolean(services.config.figmaToken),
+          auth_mode: services.config.figmaAuthMode,
           reachable: null as boolean | null,
           verification: "not_configured",
         };
@@ -135,7 +137,10 @@ export function createMcpServer(services: Services): McpServer {
           } catch (error) {
             warnings.push(toSafeError(error).safeMessage);
           }
-        } else warnings.push("FIGMA_TOKEN is not configured");
+        } else
+          warnings.push(
+            `${services.config.figmaAuthMode === "oauth" ? "FIGMA_OAUTH_ACCESS_TOKEN" : "FIGMA_TOKEN"} is not configured`,
+          );
         if (yandex.configured) {
           try {
             const result = await services.yandex.checkConnection();
@@ -346,13 +351,38 @@ export function createMcpServer(services: Services): McpServer {
             "confirmation",
             "Plan digest does not match the preview",
           );
+        if (!isPlanDigestValid(plan))
+          throw appError(
+            "PLAN_DIGEST_CORRUPT",
+            "confirmation",
+            "Stored plan outputs no longer match the preview digest; create a new plan",
+          );
         if (plan.status !== "draft" && plan.status !== "confirmed")
           throw appError(
             "PLAN_STATE_INVALID",
             "confirmation",
             `Plan in state ${plan.status} cannot be confirmed`,
           );
-        if (plan.clarifications.some((item) => item.blocking) || plan.collisions.length)
+        const planInput = plan.input as unknown as CreateExportPlanInput;
+        if (
+          planInput.packaging.mode !== "folders" &&
+          plan.manifest.length > 0 &&
+          plan.archiveManifest.length === 0
+        )
+          throw appError(
+            "PLAN_REPREVIEW_REQUIRED",
+            "confirmation",
+            "This ZIP plan predates archive path materialization; create and preview a new plan",
+          );
+        const duplicatePaths = ensureCaseInsensitiveUnique([
+          ...plan.manifest.map((item) => item.remotePath),
+          ...plan.archiveManifest.map((item) => item.remotePath),
+        ]);
+        if (
+          plan.clarifications.some((item) => item.blocking) ||
+          plan.collisions.length ||
+          duplicatePaths.length
+        )
           throw appError(
             "PLAN_HAS_UNRESOLVED_CLARIFICATIONS",
             "confirmation",

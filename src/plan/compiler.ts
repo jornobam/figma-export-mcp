@@ -1,5 +1,12 @@
 import type { CreateExportPlanInput } from "../domain/schemas.js";
-import type { Clarification, ExportPlan, Match, Snapshot } from "../domain/types.js";
+import type {
+  ArchiveManifestItem,
+  Clarification,
+  ExportPlan,
+  ManifestItem,
+  Match,
+  Snapshot,
+} from "../domain/types.js";
 import { appError } from "../errors.js";
 import { querySnapshot, safeRegex } from "../selection/engine.js";
 import {
@@ -322,6 +329,50 @@ function renderTemplate(
   });
 }
 
+function materializeArchives(
+  manifest: ManifestItem[],
+  input: CreateExportPlanInput,
+  requestedRoot: string,
+  effectiveJobFolder: string,
+): ArchiveManifestItem[] {
+  if (input.packaging.mode === "folders" || !manifest.length) return [];
+  const buckets = new Map<string, { label: string; items: ManifestItem[] }>();
+  if (input.packaging.mode === "zipPerGroup") {
+    for (const item of manifest) {
+      const values = input.packaging.archive_groups_by.map(
+        (name) => item.variables[name] ?? `_missing_${name}`,
+      );
+      const groupKey = canonicalJson(values);
+      const bucket = buckets.get(groupKey) ?? { label: values.join("__") || "group", items: [] };
+      bucket.items.push(item);
+      buckets.set(groupKey, bucket);
+    }
+  } else {
+    buckets.set("archive", { label: input.destination.job_folder, items: manifest });
+  }
+  const commonPrefix = joinRemotePath(requestedRoot, effectiveJobFolder);
+  return [...buckets.entries()].map(([groupKey, bucket], index) => {
+    const archiveStem = sanitizeSegment(
+      bucket.label,
+      input.naming.max_segment_length,
+      input.naming.whitespace,
+    );
+    return {
+      id: makeId("item"),
+      ordinal: manifest.length + index + 1,
+      groupKey,
+      groupLabel: bucket.label,
+      remotePath: joinRemotePath(requestedRoot, effectiveJobFolder, `${archiveStem}.zip`),
+      entries: bucket.items.map((item) => ({
+        itemId: item.id,
+        name: item.remotePath.startsWith(`${commonPrefix}/`)
+          ? item.remotePath.slice(commonPrefix.length + 1)
+          : item.remotePath.slice(item.remotePath.lastIndexOf("/") + 1),
+      })),
+    };
+  });
+}
+
 export function compileExportPlan(
   snapshot: Snapshot,
   input: CreateExportPlanInput,
@@ -465,10 +516,14 @@ export function compileExportPlan(
       blocking: true,
     });
   }
-  const collisionGroups = ensureCaseInsensitiveUnique(manifest.map((item) => item.remotePath));
+  const archiveManifest = materializeArchives(manifest, input, requestedRoot, effectiveJobFolder);
+  const allOutputs = [...manifest, ...archiveManifest];
+  const collisionGroups = ensureCaseInsensitiveUnique(allOutputs.map((item) => item.remotePath));
   const collisions = collisionGroups.map(({ path: normalizedPath, indexes }) => ({
-    path: manifest[indexes[0] ?? 0]?.remotePath ?? normalizedPath,
-    itemIds: indexes.map((index) => manifest[index]?.id).filter((id): id is string => Boolean(id)),
+    path: allOutputs[indexes[0] ?? 0]?.remotePath ?? normalizedPath,
+    itemIds: indexes
+      .map((index) => allOutputs[index]?.id)
+      .filter((id): id is string => Boolean(id)),
   }));
   if (collisions.length) {
     clarifications.push({
@@ -486,6 +541,7 @@ export function compileExportPlan(
     source: { fileKey: snapshot.fileKey, version: snapshot.version },
     input,
     manifest,
+    archiveManifest,
     warnings,
     clarifications,
     collisions,
@@ -500,9 +556,43 @@ export function compileExportPlan(
   };
 }
 
-export function previewPlan(plan: ExportPlan, offset = 0, pageSize = 100): Record<string, unknown> {
-  const page = plan.manifest.slice(offset, offset + pageSize);
+export function isPlanDigestValid(plan: ExportPlan): boolean {
+  const payload = {
+    schemaVersion: plan.schemaVersion,
+    snapshotId: plan.snapshotId,
+    source: plan.source,
+    input: plan.input,
+    manifest: plan.manifest,
+    archiveManifest: plan.archiveManifest,
+    warnings: plan.warnings,
+    clarifications: plan.clarifications,
+    collisions: plan.collisions,
+  };
+  if (sha256(canonicalJson(payload)) === plan.digest) return true;
+  // Pre-archive-manifest folder plans have no ZIP output and remain safely resumable.
   const input = plan.input as unknown as CreateExportPlanInput;
+  if (input.packaging.mode !== "folders" || plan.archiveManifest.length) return false;
+  const { archiveManifest: _archiveManifest, ...legacyPayload } = payload;
+  return sha256(canonicalJson(legacyPayload)) === plan.digest;
+}
+
+export function previewPlan(plan: ExportPlan, offset = 0, pageSize = 100): Record<string, unknown> {
+  const input = plan.input as unknown as CreateExportPlanInput;
+  const sourceIsRemote =
+    input.packaging.mode === "folders" || input.packaging.mode === "filesAndZip";
+  const allOutputs = [
+    ...plan.manifest.map((item) => ({
+      ...item,
+      kind: "source" as const,
+      delivery: sourceIsRemote ? "remote" : "archive_entry",
+    })),
+    ...plan.archiveManifest.map((item) => ({
+      ...item,
+      kind: "archive" as const,
+      delivery: "remote",
+    })),
+  ];
+  const page = allOutputs.slice(offset, offset + pageSize);
   return {
     schema_version: "1.0",
     plan_id: plan.id,
@@ -510,6 +600,10 @@ export function previewPlan(plan: ExportPlan, offset = 0, pageSize = 100): Recor
     status: plan.status,
     source: plan.source,
     count: plan.manifest.length,
+    source_count: plan.manifest.length,
+    archive_count: plan.archiveManifest.length,
+    output_count: (sourceIsRemote ? plan.manifest.length : 0) + plan.archiveManifest.length,
+    planned_item_count: allOutputs.length,
     order: input.ordering,
     naming: input.naming,
     grouping: input.grouping,
@@ -520,9 +614,10 @@ export function previewPlan(plan: ExportPlan, offset = 0, pageSize = 100): Recor
     warnings: plan.warnings,
     clarifications: plan.clarifications,
     collisions: plan.collisions,
-    samples: plan.manifest.slice(0, 3),
+    samples: allOutputs.slice(0, 3),
+    archive_samples: plan.archiveManifest.slice(0, 3),
     manifest: page,
-    page: { offset, page_size: pageSize, returned: page.length, total: plan.manifest.length },
+    page: { offset, page_size: pageSize, returned: page.length, total: allOutputs.length },
   };
 }
 

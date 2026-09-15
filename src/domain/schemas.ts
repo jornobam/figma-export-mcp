@@ -287,6 +287,18 @@ export const ExportPlanSchema = z.object({
   source: z.object({ fileKey: z.string(), version: z.string() }),
   input: CreateExportPlanInputSchema,
   manifest: z.array(ManifestItemSchema),
+  archiveManifest: z
+    .array(
+      z.object({
+        id: z.string().startsWith("item_"),
+        ordinal: z.int().positive(),
+        groupKey: z.string(),
+        groupLabel: z.string(),
+        remotePath: z.string(),
+        entries: z.array(z.object({ itemId: z.string().startsWith("item_"), name: z.string() })),
+      }),
+    )
+    .default([]),
   warnings: z.array(z.string()),
   clarifications: z.array(
     z.object({

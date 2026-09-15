@@ -195,6 +195,10 @@ describe("mock-server end-to-end workflow", () => {
       packaging: { mode: "filesAndZip" },
     });
     const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
+    expect(plan.archiveManifest).toHaveLength(1);
+    expect(plan.archiveManifest[0]?.entries.map((entry) => entry.itemId)).toEqual(
+      plan.manifest.map((item) => item.id),
+    );
     plan.status = "confirmed";
     plan.confirmedAt = new Date().toISOString();
     plan.confirmationSummary = "Explicitly confirmed E2E plan with one PNG and destination";
@@ -206,6 +210,7 @@ describe("mock-server end-to-end workflow", () => {
     expect(result.status).toBe("completed");
     expect((result.totals as { verified: number }).verified).toBe(2);
     expect(uploaded.size).toBe(2);
+    expect(uploaded.has(plan.archiveManifest[0]?.remotePath ?? "")).toBe(true);
     expect([...uploaded.values()].some((bytes) => bytes.toString() === "png-fixture")).toBe(true);
     expect(
       [...uploaded.entries()].some(
