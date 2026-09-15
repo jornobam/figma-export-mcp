@@ -68,6 +68,14 @@ without guessing from a token prefix, and OAuth mode reads `FIGMA_OAUTH_ACCESS_T
 The OAuth authorization/refresh lifecycle remains the responsibility of the external Figma OAuth
 app or secret manager; this STDIO server never asks for client secrets or a browser callback.
 
+## 2026-09-15 — Durable background and ZIP preparation failures
+
+ZIP setup, including source lookup, workspace creation, temporary-file cleanup, writing, and rename,
+is handled as an archive-item failure. An unexpected exception escaping any background-job stage is
+persisted as a job-level safe error and a failure event; the job and plan leave the running state.
+The MCP status response exposes both item and job-level errors. If state persistence itself is
+unavailable, the server writes a redacted diagnostic to stderr, never to the STDIO protocol stream.
+
 ## Verified official API facts
 
 - Figma file/image endpoints require `file_content:read`; image rendering supports PNG/JPG/SVG/PDF,

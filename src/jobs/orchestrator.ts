@@ -160,9 +160,36 @@ export class JobOrchestrator {
   start(jobId: string): void {
     if (this.active.has(jobId)) return;
     const promise = this.run(jobId)
-      .catch(() => undefined)
+      .catch(async (error) => {
+        try {
+          await this.recordRunFailure(jobId, error);
+        } catch (persistenceError) {
+          const safe = toSafeError(persistenceError, "state");
+          process.stderr.write(
+            `Could not persist failure for job ${jobId}: ${safe.code}: ${safe.safeMessage}\n`,
+          );
+        }
+      })
       .finally(() => this.active.delete(jobId));
     this.active.set(jobId, promise);
+  }
+
+  private async recordRunFailure(jobId: string, error: unknown): Promise<void> {
+    const job = await this.store.getJob(jobId);
+    const failure = toSafeError(error, "execution");
+    job.runError = failure;
+    if (["queued", "running"].includes(job.status)) {
+      job.status = job.items.some((item) =>
+        ["uploaded", "verified", "cleaned"].includes(item.stage),
+      )
+        ? "partial"
+        : "failed";
+    }
+    this.addEvent(job, "failed", `${failure.code}: ${failure.safeMessage}`);
+    await this.save(job);
+    const plan = await this.store.getPlan(job.planId);
+    plan.status = job.status === "queued" ? "failed" : job.status;
+    await this.store.savePlan(plan);
   }
 
   async wait(jobId: string): Promise<void> {
@@ -317,18 +344,6 @@ export class JobOrchestrator {
     if (sources.some((item) => item.stage === "failed" || !item.localRelativePath)) return;
     const sourcesById = new Map(sources.map((item) => [item.id, item]));
     for (const archive of plan.archiveManifest) {
-      const items = archive.entries.map((entry) => sourcesById.get(entry.itemId));
-      if (items.some((item) => !item)) {
-        throw appError(
-          "PLAN_ARCHIVE_SOURCE_MISSING",
-          "packaging",
-          "Archive refers to a source item absent from the confirmed plan",
-        );
-      }
-      const entries = archive.entries.map((entry) => ({
-        name: entry.name,
-        path: this.localPath(job, sourcesById.get(entry.itemId) as JobItem),
-      }));
       let archiveItem = job.items.find((item) => item.id === archive.id);
       if (!archiveItem) {
         archiveItem = {
@@ -353,51 +368,57 @@ export class JobOrchestrator {
         ["downloaded", "transformed", "uploaded", "verified", "cleaned"].includes(archiveItem.stage)
       )
         continue;
-      const workspace = this.store.workspacePath(job.workspaceName);
-      const itemsDir = path.join(workspace, "items");
-      await mkdir(itemsDir, { recursive: true });
-      const target = path.join(itemsDir, `${archiveItem.id}.zip`);
-      const temporary = path.join(itemsDir, `.${archiveItem.id}.zip.partial`);
-      assertInside(workspace, target);
-      assertInside(workspace, temporary);
-      await Promise.all([rm(temporary, { force: true }), rm(target, { force: true })]);
-      const used = job.items.reduce(
-        (total, current) => total + (current.id === archiveItem.id ? 0 : (current.localSize ?? 0)),
-        0,
-      );
-      const remaining = this.config.maxTempBytes - used;
-      if (remaining <= 0) {
-        await this.failItem(
-          job,
-          archiveItem,
-          appError(
+      try {
+        if (archive.entries.some((entry) => !sourcesById.has(entry.itemId))) {
+          throw appError(
+            "PLAN_ARCHIVE_SOURCE_MISSING",
+            "packaging",
+            "Archive refers to a source item absent from the confirmed plan",
+          );
+        }
+        const entries = archive.entries.map((entry) => ({
+          name: entry.name,
+          path: this.localPath(job, sourcesById.get(entry.itemId) as JobItem),
+        }));
+        const workspace = this.store.workspacePath(job.workspaceName);
+        const itemsDir = path.join(workspace, "items");
+        await mkdir(itemsDir, { recursive: true });
+        const target = path.join(itemsDir, `${archiveItem.id}.zip`);
+        const temporary = path.join(itemsDir, `.${archiveItem.id}.zip.partial`);
+        assertInside(workspace, target);
+        assertInside(workspace, temporary);
+        await Promise.all([rm(temporary, { force: true }), rm(target, { force: true })]);
+        const used = job.items.reduce(
+          (total, current) =>
+            total + (current.id === archiveItem.id ? 0 : (current.localSize ?? 0)),
+          0,
+        );
+        const remaining = this.config.maxTempBytes - used;
+        if (remaining <= 0) {
+          throw appError(
             "TEMP_LIMIT_EXCEEDED",
             "packaging",
             "Job has no temporary storage budget remaining for an archive",
-          ),
-          "packaging",
-        );
-        continue;
-      }
-      try {
+          );
+        }
         const result = await createZipFile(entries, temporary, remaining);
         await rename(temporary, target);
         archiveItem.localRelativePath = path.relative(workspace, target);
         archiveItem.localSize = result.size;
         archiveItem.localSha256 = result.sha256;
         archiveItem.stage = "downloaded";
+        delete archiveItem.error;
         this.addEvent(job, "downloaded", `Created ${result.size}-byte archive`, archiveItem.id);
         await this.save(job);
+        this.addEvent(
+          job,
+          "packaging",
+          `Created archive containing ${archive.entries.length} entries`,
+          archiveItem.id,
+        );
       } catch (error) {
         await this.failItem(job, archiveItem, error, "packaging");
-        continue;
       }
-      this.addEvent(
-        job,
-        "packaging",
-        `Created archive containing ${archive.entries.length} entries`,
-        archiveItem.id,
-      );
     }
     await this.save(job);
   }
@@ -555,13 +576,14 @@ export class JobOrchestrator {
     );
     if (previous) return job;
     const retryable = job.items.filter((item) => item.stage === "failed" && item.error?.retryable);
-    if (!retryable.length)
+    if (!retryable.length && !job.runError?.retryable)
       throw appError("NO_RETRYABLE_ITEMS", "retry", "Job has no failed retryable items");
     for (const item of retryable) {
       item.stage = item.localRelativePath ? "downloaded" : "planned";
       delete item.error;
     }
     job.status = "queued";
+    delete job.runError;
     this.addEvent(job, "retry", idempotencyKey);
     await this.save(job);
     this.start(job.id);
@@ -650,8 +672,13 @@ export class JobOrchestrator {
       retry_delays: job.items
         .filter((item) => item.error?.retryAfterSeconds)
         .map((item) => ({ item_id: item.id, seconds: item.error?.retryAfterSeconds })),
-      errors: job.items.flatMap((item) => (item.error ? [item.error] : [])),
-      can_resume: job.items.some((item) => item.stage === "failed" && item.error?.retryable),
+      errors: [
+        ...(job.runError ? [job.runError] : []),
+        ...job.items.flatMap((item) => (item.error ? [item.error] : [])),
+      ],
+      can_resume:
+        job.runError?.retryable === true ||
+        job.items.some((item) => item.stage === "failed" && item.error?.retryable),
       remote_paths: job.items
         .filter((item) => ["uploaded", "verified", "cleaned"].includes(item.stage))
         .slice(0, 100)

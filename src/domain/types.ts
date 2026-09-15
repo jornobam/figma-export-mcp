@@ -199,6 +199,7 @@ export type ExportJob = {
   workspaceName: string;
   items: JobItem[];
   events: JobEvent[];
+  runError?: SafeError;
   cleanupComplete: boolean;
 };
 
