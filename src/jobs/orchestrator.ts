@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "../config.js";
 import type { CreateExportPlanInput } from "../domain/schemas.js";
 import type { ExportJob, ExportPlan, JobItem } from "../domain/types.js";
 import { AppError, appError, toSafeError } from "../errors.js";
 import type { FigmaClient } from "../figma/client.js";
-import { createZip } from "../packaging/zip.js";
+import { createZipFile } from "../packaging/zip.js";
 import type { StateStore } from "../state/store.js";
 import {
   assertInside,
@@ -70,7 +70,7 @@ export class JobOrchestrator {
             joinRemotePath(
               input.destination.root,
               effectiveJobFolder,
-              `${sanitizeSegment(key)}.zip`,
+              `${sanitizeSegment(key, input.naming.max_segment_length, input.naming.whitespace)}.zip`,
             ),
           );
       } else {
@@ -78,7 +78,11 @@ export class JobOrchestrator {
           joinRemotePath(
             input.destination.root,
             effectiveJobFolder,
-            `${sanitizeSegment(input.destination.job_folder)}.zip`,
+            `${sanitizeSegment(
+              input.destination.job_folder,
+              input.naming.max_segment_length,
+              input.naming.whitespace,
+            )}.zip`,
           ),
         );
       }
@@ -249,8 +253,8 @@ export class JobOrchestrator {
     input: CreateExportPlanInput,
   ): Promise<void> {
     const localPath = this.localPath(job, item);
-    const bytes = new Uint8Array(await readFile(localPath));
-    if (bytes.byteLength !== item.localSize || !item.localSha256) {
+    const local = await stat(localPath);
+    if (!local.isFile() || local.size !== item.localSize || !item.localSha256) {
       throw appError(
         "LOCAL_CHECKPOINT_CORRUPT",
         "filesystem",
@@ -296,12 +300,15 @@ export class JobOrchestrator {
       item.uploadAttempted = true;
       item.stage = "transformed";
       await this.save(job);
-      await this.yandex.upload(item.remotePath, bytes);
+      await this.yandex.uploadFile(item.remotePath, localPath, {
+        size: local.size,
+        sha256: item.localSha256,
+      });
       item.stage = "uploaded";
-      this.addEvent(job, "uploaded", `Uploaded ${bytes.byteLength} bytes`, item.id);
+      this.addEvent(job, "uploaded", `Uploaded ${local.size} bytes`, item.id);
       await this.save(job);
       await this.yandex.verify(item.remotePath, {
-        size: bytes.byteLength,
+        size: local.size,
         sha256: item.localSha256,
       });
       item.stage = "verified";
@@ -313,6 +320,8 @@ export class JobOrchestrator {
         item.id,
       );
     }
+    // Commit the verification checkpoint before deleting the only local recovery copy.
+    await this.save(job);
     await unlink(localPath);
     item.stage = "cleaned";
     this.addEvent(job, "cleaned", "Removed local item after remote verification", item.id);
@@ -324,8 +333,7 @@ export class JobOrchestrator {
     input: CreateExportPlanInput,
     sourceVersion: string,
   ): Promise<void> {
-    if (input.packaging.mode === "folders" || job.items.some((item) => item.kind === "archive"))
-      return;
+    if (input.packaging.mode === "folders") return;
     const sources = job.items.filter((item) => item.kind !== "archive");
     if (sources.some((item) => item.stage === "failed" || !item.localRelativePath)) return;
     const groups = new Map<string, JobItem[]>();
@@ -348,36 +356,83 @@ export class JobOrchestrator {
     );
     for (const [key, items] of groups) {
       const commonPrefix = joinRemotePath(input.destination.root, effectiveJobFolder);
-      const entries = await Promise.all(
-        items.map(async (item) => ({
-          name: item.remotePath.startsWith(`${commonPrefix}/`)
-            ? item.remotePath.slice(commonPrefix.length + 1)
-            : path.posix.basename(item.remotePath),
-          bytes: new Uint8Array(await readFile(this.localPath(job, item))),
-        })),
-      );
-      const bytes = createZip(entries);
+      const entries = items.map((item) => ({
+        name: item.remotePath.startsWith(`${commonPrefix}/`)
+          ? item.remotePath.slice(commonPrefix.length + 1)
+          : path.posix.basename(item.remotePath),
+        path: this.localPath(job, item),
+      }));
       const archiveName =
         input.packaging.mode === "zipPerGroup"
-          ? `${sanitizeSegment(key)}.zip`
-          : `${sanitizeSegment(input.destination.job_folder)}.zip`;
-      const archiveItem: JobItem = {
-        id: makeId("item"),
-        ordinal: job.items.length + 1,
-        nodeId: `archive:${key}`,
-        matchedNodeId: `archive:${key}`,
-        hierarchyPath: ["archive", key],
-        variables: { archive_group: key, ext: "zip" },
-        remotePath: joinRemotePath(input.destination.root, effectiveJobFolder, archiveName),
-        reasons: ["packaging"],
-        confidence: 1,
-        kind: "archive",
-        archiveSourceItemIds: items.map((item) => item.id),
-        stage: "planned",
-        attempts: 0,
-      };
-      job.items.push(archiveItem);
-      await this.persistBytes(job, archiveItem, bytes, "zip");
+          ? `${sanitizeSegment(key, input.naming.max_segment_length, input.naming.whitespace)}.zip`
+          : `${sanitizeSegment(
+              input.destination.job_folder,
+              input.naming.max_segment_length,
+              input.naming.whitespace,
+            )}.zip`;
+      let archiveItem = job.items.find((item) => item.nodeId === `archive:${key}`);
+      if (!archiveItem) {
+        archiveItem = {
+          id: makeId("item"),
+          ordinal: job.items.length + 1,
+          nodeId: `archive:${key}`,
+          matchedNodeId: `archive:${key}`,
+          hierarchyPath: ["archive", key],
+          variables: { archive_group: key, ext: "zip" },
+          remotePath: joinRemotePath(input.destination.root, effectiveJobFolder, archiveName),
+          reasons: ["packaging"],
+          confidence: 1,
+          kind: "archive",
+          archiveSourceItemIds: items.map((item) => item.id),
+          stage: "planned",
+          attempts: 0,
+        };
+        job.items.push(archiveItem);
+        await this.save(job);
+      }
+      if (
+        ["downloaded", "transformed", "uploaded", "verified", "cleaned"].includes(archiveItem.stage)
+      )
+        continue;
+      const workspace = this.store.workspacePath(job.workspaceName);
+      const itemsDir = path.join(workspace, "items");
+      await mkdir(itemsDir, { recursive: true });
+      const target = path.join(itemsDir, `${archiveItem.id}.zip`);
+      const temporary = path.join(itemsDir, `.${archiveItem.id}.zip.partial`);
+      assertInside(workspace, target);
+      assertInside(workspace, temporary);
+      await Promise.all([rm(temporary, { force: true }), rm(target, { force: true })]);
+      const used = job.items.reduce(
+        (total, current) => total + (current.id === archiveItem.id ? 0 : (current.localSize ?? 0)),
+        0,
+      );
+      const remaining = this.config.maxTempBytes - used;
+      if (remaining <= 0) {
+        await this.failItem(
+          job,
+          archiveItem,
+          appError(
+            "TEMP_LIMIT_EXCEEDED",
+            "packaging",
+            "Job has no temporary storage budget remaining for an archive",
+          ),
+          "packaging",
+        );
+        continue;
+      }
+      try {
+        const result = await createZipFile(entries, temporary, remaining);
+        await rename(temporary, target);
+        archiveItem.localRelativePath = path.relative(workspace, target);
+        archiveItem.localSize = result.size;
+        archiveItem.localSha256 = result.sha256;
+        archiveItem.stage = "downloaded";
+        this.addEvent(job, "downloaded", `Created ${result.size}-byte archive`, archiveItem.id);
+        await this.save(job);
+      } catch (error) {
+        await this.failItem(job, archiveItem, error, "packaging");
+        continue;
+      }
       this.addEvent(
         job,
         "packaging",

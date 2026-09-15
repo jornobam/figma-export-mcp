@@ -1,4 +1,12 @@
+import { createHash } from "node:crypto";
+import { createWriteStream } from "node:fs";
+import { mkdir, rm, stat } from "node:fs/promises";
+import path from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { ZipFile } from "yazl";
 import { appError } from "../errors.js";
+import { mapLimit } from "../util.js";
 
 const CRC_TABLE = Array.from({ length: 256 }, (_, index) => {
   let value = index;
@@ -104,6 +112,69 @@ export function createZip(entries: Array<{ name: string; bytes: Uint8Array }>): 
     u16(0),
   ]);
   return Buffer.concat([...localParts, central, end]);
+}
+
+export async function createZipFile(
+  entries: Array<{ name: string; path: string }>,
+  destination: string,
+  maxBytes: number,
+): Promise<{ size: number; sha256: string }> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw appError("INVALID_TEMP_LIMIT", "packaging", "ZIP output limit must be positive");
+  }
+  const prepared = await mapLimit(entries, 32, async (entry) => {
+    const source = await stat(entry.path);
+    if (!source.isFile())
+      throw appError("ZIP_SOURCE_INVALID", "packaging", "ZIP source is not a regular file");
+    return { name: safeEntryName(entry.name), path: entry.path };
+  });
+  await mkdir(path.dirname(destination), { recursive: true });
+  const digest = createHash("sha256");
+  let size = 0;
+  const meter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      size += chunk.byteLength;
+      if (size > maxBytes) {
+        callback(
+          appError(
+            "TEMP_LIMIT_EXCEEDED",
+            "packaging",
+            "Archive exceeds the configured temporary storage limit",
+          ),
+        );
+        return;
+      }
+      digest.update(chunk);
+      callback(null, chunk);
+    },
+  });
+  const archive = new ZipFile();
+  const writing = pipeline(
+    archive.outputStream,
+    meter,
+    createWriteStream(destination, { flags: "wx", mode: 0o600 }),
+  );
+  try {
+    // DOS timestamps encode local wall-clock fields. Using local midnight and omitting the
+    // extended UTC timestamp makes the resulting metadata identical in every host timezone.
+    const fixedDate = new Date(1980, 0, 1, 0, 0, 0, 0);
+    for (const entry of prepared) {
+      archive.addFile(entry.path, entry.name, {
+        mtime: fixedDate,
+        mode: 0o100600,
+        compress: false,
+        forceDosTimestamp: true,
+      });
+    }
+    archive.end({ forceZip64Format: true, comment: "" });
+    await writing;
+    return { size, sha256: `sha256:${digest.digest("hex")}` };
+  } catch (error) {
+    meter.destroy();
+    await writing.catch(() => undefined);
+    await rm(destination, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 export { crc32, safeEntryName };

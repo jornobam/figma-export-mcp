@@ -106,8 +106,9 @@ export function createMcpServer(services: Services): McpServer {
   server.registerTool(
     "check_connections",
     {
-      title: "Check Figma, Yandex Disk and state-store connections",
-      description: "Checks configuration and reachability without returning secrets.",
+      title: "Check Figma, Yandex Disk and state-store readiness",
+      description:
+        "Checks configuration and safe reachability where possible without requiring extra scopes or returning secrets.",
       inputSchema: z.object({}),
       outputSchema: OutputSchema,
       annotations: { readOnlyHint: true, idempotentHint: true },
@@ -117,8 +118,8 @@ export function createMcpServer(services: Services): McpServer {
         const warnings: string[] = [];
         const figma = {
           configured: Boolean(services.config.figmaToken),
-          reachable: false as boolean,
-          identity_hint: undefined as string | undefined,
+          reachable: null as boolean | null,
+          verification: "not_configured",
         };
         const yandex = {
           configured: Boolean(services.config.yandexToken),
@@ -129,8 +130,8 @@ export function createMcpServer(services: Services): McpServer {
         if (figma.configured) {
           try {
             const result = await services.figma.checkConnection();
-            figma.reachable = true;
-            figma.identity_hint = result.identityHint;
+            figma.reachable = result.reachable;
+            figma.verification = result.verification;
           } catch (error) {
             warnings.push(toSafeError(error).safeMessage);
           }

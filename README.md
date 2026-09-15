@@ -75,4 +75,9 @@ FIGMA_TOKEN=... YANDEX_DISK_TOKEN=... npm start
 
 `npm run check` выполняет typecheck, lint, unit/integration tests, build и MCP smoke. `npm run mcp:inspect` проверяет MCP initialization, instructions, schemas и structured output без сети. Если Figma отвечает 429, клиент уважает `Retry-After`; 5xx повторяются с ограниченным backoff. Ошибка `PLAN_NOT_CONFIRMED` означает, что сначала нужно показать preview и подтвердить его digest. Ошибки сети Яндекс Диска безопасно возобновляются через `retry_failed_items`.
 
+Для OAuth Figma достаточно `file_content:read`: `check_connections` не обращается к `/v1/me`, а
+доступ проверяется при `inspect_figma_file`. ZIP64 создаётся и загружается потоково, поэтому память
+процесса не растёт пропорционально суммарному размеру архива; дисковый предел задаётся
+`FIGMA_EXPORT_MAX_TEMP_BYTES`.
+
 Для реальных read-only проверок предусмотрен opt-in скрипт `LIVE_SMOKE_CONFIRM=YES npm run live:smoke`; он не загружает и не удаляет данные.

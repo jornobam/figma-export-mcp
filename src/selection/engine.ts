@@ -70,6 +70,25 @@ function inRange(actual: number | undefined, range: { min?: number; max?: number
   );
 }
 
+function intersectTypes(left: Set<string> | undefined, right: Set<string> | undefined) {
+  if (!left) return right;
+  if (!right) return left;
+  return new Set([...left].filter((type) => right.has(type)));
+}
+
+function constrainedTypes(selector: Selector): Set<string> | undefined {
+  let result = selector.type ? new Set(selector.type.in) : undefined;
+  for (const part of selector.all ?? []) result = intersectTypes(result, constrainedTypes(part));
+  if (selector.any?.length) {
+    const alternatives = selector.any.map(constrainedTypes);
+    if (alternatives.every((types): types is Set<string> => types !== undefined)) {
+      const union = new Set(alternatives.flatMap((types) => [...types]));
+      result = intersectTypes(result, union);
+    }
+  }
+  return result;
+}
+
 function evaluate(
   node: NormalizedNode,
   selector: Selector,
@@ -201,12 +220,23 @@ export function querySnapshot(
   const candidates = Object.values(snapshot.nodes).filter(
     (node) => node.type !== "DOCUMENT" && node.type !== "CANVAS",
   );
-  const geometry = analyzeGeometry(candidates, {
+  const target = options.exportTarget ?? { mode: "self" };
+  const selectionTypes = constrainedTypes(selector);
+  const targetTypes = target.where ? constrainedTypes(target.where) : undefined;
+  const geometryTypes =
+    target.mode === "self"
+      ? selectionTypes
+      : targetTypes
+        ? new Set([...(selectionTypes ?? []), ...targetTypes])
+        : undefined;
+  const geometryCandidates = geometryTypes?.size
+    ? candidates.filter((node) => geometryTypes.has(node.type))
+    : candidates;
+  const geometry = analyzeGeometry(geometryCandidates, {
     toleranceFactor: options.toleranceFactor,
     global: options.global,
   });
   const matches: Match[] = [];
-  const target = options.exportTarget ?? { mode: "self" };
   const seen = new Set<string>();
   for (const node of candidates) {
     const reasons: string[] = [];

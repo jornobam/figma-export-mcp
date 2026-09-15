@@ -1,15 +1,15 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config.js";
 import { CreateExportPlanInputSchema } from "../../src/domain/schemas.js";
 import type { Match } from "../../src/domain/types.js";
-import type { FigmaClient } from "../../src/figma/client.js";
+import { FigmaClient } from "../../src/figma/client.js";
 import { normalizeFigmaFile } from "../../src/figma/snapshot.js";
 import { normalizeNodeId, parseFigmaReference } from "../../src/figma/url.js";
 import { JobOrchestrator } from "../../src/jobs/orchestrator.js";
-import { createZip } from "../../src/packaging/zip.js";
+import { createZip, createZipFile } from "../../src/packaging/zip.js";
 import { compileExportPlan, orderMatches, selectedByPositions } from "../../src/plan/compiler.js";
 import { matchesString, querySnapshot, safeRegex } from "../../src/selection/engine.js";
 import { analyzeGeometry } from "../../src/selection/geometry.js";
@@ -161,11 +161,27 @@ describe("universal selector and geometry engine", () => {
     const result = analyzeGeometry(nodes);
     expect(result.rows.length).toBeGreaterThanOrEqual(2);
     expect(result.toleranceY).toBeGreaterThan(1);
-    expect(result.warnings.some((warning) => warning.includes("unequal"))).toBe(true);
+    expect(result.warnings.some((warning) => warning.includes("unequal"))).toBe(false);
     expect(result.layout.get("3:1")?.blockIndex).toBe(1);
     expect(result.layout.get("4:1")?.blockIndex).toBe(2);
     expect(result.layout.get("3:1")?.dimensionsSimilarToPeers).toBe(true);
     expect(result.layout.get("4:1")?.dimensionsSimilarToPeers).toBe(false);
+  });
+
+  it("numbers rows locally without allowing child text to shift parent frames", () => {
+    const result = querySnapshot(fixture(), {
+      type: { in: ["FRAME"] },
+      rowIndex: 1,
+      visible: true,
+    });
+    expect(result.matches.map((match) => match.exportNode.id)).toEqual(["3:1", "3:2", "4:1"]);
+    expect(result.layout.layout.get("3:1")?.rowIndex).toBe(1);
+    expect(result.layout.layout.get("3:1")?.groupKey).toBe("2:0");
+    expect(
+      result.layout.rows
+        .flatMap((row) => row.nodeIds)
+        .every((id) => id.startsWith("3:") || id.startsWith("4:")),
+    ).toBe(true);
   });
 
   it("evaluates blockIndex and dimensionsSimilarToPeers selectors", () => {
@@ -210,6 +226,23 @@ describe("universal selector and geometry engine", () => {
     expect(ruled.map((match) => match.exportNode.id)).toEqual(["r1c3", "r2c1"]);
   });
 
+  it("keeps equal local row indexes in separate visual blocks", () => {
+    const first = layoutMatch("block-1-row-1", 1, 1);
+    first.layout = { ...first.layout, blockIndex: 1, groupKey: "block-1" };
+    const second = layoutMatch("block-2-row-1", 1, 1);
+    second.layout = { ...second.layout, blockIndex: 2, groupKey: "block-2" };
+    const selected = selectedByPositions(
+      [first, second],
+      positionInput({ layout: "rows", rows: [1], columns: [1], perGroupLimit: 1 }),
+      [],
+      [],
+    );
+    expect(selected.map((match) => match.exportNode.id)).toEqual([
+      "block-1-row-1",
+      "block-2-row-1",
+    ]);
+  });
+
   it("transposes grouping when position layout is columns", () => {
     const matches = [1, 2].flatMap((row) =>
       [1, 2, 3].map((column) => layoutMatch(`r${row}c${column}`, row, column)),
@@ -244,6 +277,39 @@ describe("universal selector and geometry engine", () => {
       "r2c1",
       "r1c2",
     ]);
+  });
+
+  it("honors declared tie breakers instead of applying implicit hierarchy order", () => {
+    const left = layoutMatch("node-b", 1, 1);
+    const right = layoutMatch("node-a", 1, 1);
+    left.exportNode.hierarchyPath = ["A"];
+    right.exportNode.hierarchyPath = ["B"];
+    const byNodeId = CreateExportPlanInputSchema.parse({
+      snapshot_id: "snap_fixture",
+      ordering: { mode: "hierarchy", tieBreakers: ["nodeId"] },
+      destination: { job_folder: "Test" },
+    });
+    expect(orderMatches([left, right], byNodeId).map((match) => match.exportNode.id)).toEqual([
+      "node-a",
+      "node-b",
+    ]);
+  });
+});
+
+describe("connection checks", () => {
+  it("does not call /v1/me or require current_user:read for a Figma readiness check", async () => {
+    let fetchCalls = 0;
+    const config = loadConfig({ FIGMA_TOKEN: "figd_file_content_only" });
+    const figma = new FigmaClient(config, async () => {
+      fetchCalls += 1;
+      throw new Error("network must not be used");
+    });
+    await expect(figma.checkConnection()).resolves.toEqual({
+      configured: true,
+      reachable: null,
+      verification: "deferred_until_file_inspection",
+    });
+    expect(fetchCalls).toBe(0);
   });
 });
 
@@ -338,6 +404,54 @@ describe("safe Yandex collision handling", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it("persists verified state before deleting the local checkpoint", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "figma-export-checkpoint-"));
+    try {
+      const store = new StateStore(root);
+      await store.initialize();
+      const savedStages: string[] = [];
+      const saveJob = store.saveJob.bind(store);
+      store.saveJob = async (job) => {
+        savedStages.push(job.items[0]?.stage ?? "none");
+        await saveJob(job);
+      };
+      const snapshot = fixture();
+      const input = CreateExportPlanInputSchema.parse({
+        snapshot_id: snapshot.id,
+        selection: { id: "3:1" },
+        destination: { root: "/AI Exports", job_folder: "Checkpoint" },
+        collision_policy: "skip_identical",
+      });
+      const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
+      plan.status = "confirmed";
+      await store.savePlan(plan);
+      const figma = {
+        getCurrentVersion: async () => "42",
+        renderImages: async (_fileKey: string, ids: string[]) =>
+          Object.fromEntries(ids.map((id) => [id, `https://example.com/${id}`])),
+        downloadRendered: async () => new TextEncoder().encode("abc"),
+      } as unknown as FigmaClient;
+      const yandex = {
+        getMetadata: async () => null,
+        uploadFile: async () => undefined,
+        verify: async () => ({ type: "file", size: 3 }),
+      } as unknown as YandexDiskClient;
+      const jobs = new JobOrchestrator(
+        loadConfig({ FIGMA_EXPORT_STATE_DIR: root }),
+        store,
+        figma,
+        yandex,
+      );
+      const job = await jobs.execute(plan, plan.digest, "checkpoint-1");
+      await jobs.wait(job.id);
+      expect(savedStages.indexOf("verified")).toBeGreaterThan(-1);
+      expect(savedStages.indexOf("verified")).toBeLessThan(savedStages.indexOf("cleaned"));
+      expect((await store.getJob(job.id)).status).toBe("completed");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("immutable plans, variables and ZIP", () => {
@@ -388,6 +502,42 @@ describe("immutable plans, variables and ZIP", () => {
     expect(plan.manifest.every((item) => item.remotePath.includes("/Versioned--v-42/"))).toBe(true);
   });
 
+  it("preserves or collapses naming whitespace according to the public option", () => {
+    const snapshot = fixture();
+    const makePlan = (whitespace: "preserve" | "collapse") =>
+      compileExportPlan(
+        snapshot,
+        CreateExportPlanInputSchema.parse({
+          snapshot_id: snapshot.id,
+          selection: { id: "3:1" },
+          naming: { template: "A  B.png", whitespace },
+          destination: { root: "/AI Exports", job_folder: "Whitespace" },
+        }),
+        "/AI Exports",
+        100,
+      );
+    expect(makePlan("preserve").manifest[0]?.remotePath).toContain("/A  B.png");
+    expect(makePlan("collapse").manifest[0]?.remotePath).toContain("/A B.png");
+  });
+
+  it("restarts row-scoped sequences in every local visual block", () => {
+    const snapshot = fixture();
+    const plan = compileExportPlan(
+      snapshot,
+      CreateExportPlanInputSchema.parse({
+        snapshot_id: snapshot.id,
+        selection: { type: { in: ["FRAME"] }, visible: true },
+        variables: { sequence: { from: "sequence", scope: "row", start: 1 } },
+        naming: { template: "{sequence}-{index}.png" },
+        ordering: { mode: "row-major" },
+        destination: { root: "/AI Exports", job_folder: "Sequence" },
+      }),
+      "/AI Exports",
+      100,
+    );
+    expect(plan.manifest.map((item) => item.variables.sequence)).toEqual(["1", "2", "1"]);
+  });
+
   it("writes a valid deterministic ZIP and persists state atomically", async () => {
     const zip = createZip([
       { name: "Русский/hello.txt", bytes: new TextEncoder().encode("hello") },
@@ -406,6 +556,39 @@ describe("immutable plans, variables and ZIP", () => {
       expect(
         await readFile(path.join(root, "snapshots", `${snapshot.id}.json`), "utf8"),
       ).not.toContain("figd_");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("writes ZIP64 archives to disk through a bounded-memory stream", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "figma-export-stream-zip-"));
+    try {
+      const source = path.join(root, "source.bin");
+      const destination = path.join(root, "archive.zip");
+      const duplicate = path.join(root, "archive-copy.zip");
+      const rejected = path.join(root, "too-large.zip");
+      await writeFile(source, Buffer.alloc(2 * 1024 * 1024, 0x5a));
+      const result = await createZipFile(
+        [{ name: "large/source.bin", path: source }],
+        destination,
+        4 * 1024 * 1024,
+      );
+      const bytes = await readFile(destination);
+      expect(bytes.readUInt32LE(0)).toBe(0x04034b50);
+      expect(result.size).toBe(bytes.byteLength);
+      expect(result.sha256).toBe(sha256(bytes));
+      expect(bytes.includes(Buffer.from("PK\u0006\u0006", "binary"))).toBe(true);
+      const duplicateResult = await createZipFile(
+        [{ name: "large/source.bin", path: source }],
+        duplicate,
+        4 * 1024 * 1024,
+      );
+      expect(duplicateResult.sha256).toBe(result.sha256);
+      await expect(
+        createZipFile([{ name: "large/source.bin", path: source }], rejected, 1024),
+      ).rejects.toThrow(/temporary storage limit/iu);
+      await expect(readFile(rejected)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

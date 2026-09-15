@@ -81,7 +81,7 @@ function selectedByPositions(
 ): Match[] {
   const selection = input.position_selection;
   if (!selection) return matches;
-  const groups = new Map<number, Match[]>();
+  const groups = new Map<string, { index: number; blockIndex: number; matches: Match[] }>();
   const isRows = selection.layout === "rows";
   const groupLabel = isRows ? "Row" : "Column";
   const groupIndex = (match: Match) => (isRows ? match.layout.rowIndex : match.layout.columnIndex);
@@ -89,19 +89,26 @@ function selectedByPositions(
     isRows ? match.layout.columnIndex : match.layout.rowIndex;
   for (const match of matches) {
     const index = groupIndex(match);
-    if (index !== undefined) groups.set(index, [...(groups.get(index) ?? []), match]);
+    if (index !== undefined) {
+      const blockIndex = match.layout.blockIndex ?? 0;
+      const key = `${match.layout.groupKey ?? "root"}\0${index}`;
+      const group = groups.get(key) ?? { index, blockIndex, matches: [] };
+      group.matches.push(match);
+      groups.set(key, group);
+    }
   }
   for (const group of groups.values()) {
-    group.sort(
+    group.matches.sort(
       (a, b) =>
         (positionIndex(a) ?? 0) - (positionIndex(b) ?? 0) ||
         a.exportNode.id.localeCompare(b.exportNode.id, "en"),
     );
   }
   const selected = new Map<string, Match>();
-  const wantedGroups = selection.rows === "all" ? [...groups.keys()] : selection.rows;
-  const addIndexes = (groupNumber: number, positions: number[]) => {
-    const group = groups.get(groupNumber) ?? [];
+  const wantedGroups = [...groups.values()]
+    .filter((group) => selection.rows === "all" || selection.rows.includes(group.index))
+    .sort((a, b) => a.blockIndex - b.blockIndex || a.index - b.index);
+  const addIndexes = (group: Match[], groupNumber: number, positions: number[]) => {
     let added = 0;
     for (const position of positions) {
       const match = group[position - 1];
@@ -160,8 +167,9 @@ function selectedByPositions(
       selection.range ||
       selection.everyNth,
   );
-  for (const groupNumber of wantedGroups) {
-    const group = groups.get(groupNumber) ?? [];
+  for (const grouped of wantedGroups) {
+    const groupNumber = grouped.index;
+    const group = grouped.matches;
     const positions = new Set<number>();
     for (const item of selection.columns ?? selection.explicitIndexes ?? []) positions.add(item);
     addRulePositions(positions, selection, group.length);
@@ -188,6 +196,7 @@ function selectedByPositions(
       continue;
     }
     addIndexes(
+      group,
       groupNumber,
       [...positions].sort((a, b) => a - b),
     );
@@ -199,12 +208,14 @@ function orderMatches(matches: Match[], input: CreateExportPlanInput): Match[] {
   const directionY = input.ordering.rowDirection === "top-to-bottom" ? 1 : -1;
   const directionX = input.ordering.itemDirection === "left-to-right" ? 1 : -1;
   const custom = new Map((input.ordering.customNodeIds ?? []).map((id, index) => [id, index]));
-  const maxColumnByRow = new Map<number, number>();
+  const maxColumnByRow = new Map<string, number>();
+  const rowKey = (match: Match) =>
+    `${match.layout.groupKey ?? "root"}\0${match.layout.rowIndex ?? 0}`;
   for (const match of matches) {
     const row = match.layout.rowIndex;
     const column = match.layout.columnIndex;
     if (row !== undefined && column !== undefined)
-      maxColumnByRow.set(row, Math.max(maxColumnByRow.get(row) ?? 0, column));
+      maxColumnByRow.set(rowKey(match), Math.max(maxColumnByRow.get(rowKey(match)) ?? 0, column));
   }
   const positionRank = (match: Match): number => {
     const column = match.layout.columnIndex;
@@ -212,20 +223,58 @@ function orderMatches(matches: Match[], input: CreateExportPlanInput): Match[] {
     const priorities = input.ordering.positionPriority ?? [];
     for (const [index, value] of priorities.entries()) {
       if (typeof value === "number" && value === column) return index;
-      if (value === "last" && row !== undefined && column === maxColumnByRow.get(row)) return index;
+      if (value === "last" && row !== undefined && column === maxColumnByRow.get(rowKey(match)))
+        return index;
     }
     return Number.MAX_SAFE_INTEGER;
+  };
+  const compareTieBreakers = (a: Match, b: Match): number => {
+    for (const key of input.ordering.tieBreakers) {
+      let left: string | number | undefined;
+      let right: string | number | undefined;
+      switch (key) {
+        case "hierarchyPath":
+          left = a.exportNode.hierarchyPath.join("/");
+          right = b.exportNode.hierarchyPath.join("/");
+          break;
+        case "nodeId":
+          left = a.exportNode.id;
+          right = b.exportNode.id;
+          break;
+        case "name":
+          left = a.exportNode.name;
+          right = b.exportNode.name;
+          break;
+        case "rowIndex":
+        case "columnIndex":
+        case "blockIndex":
+          left = a.layout[key];
+          right = b.layout[key];
+          break;
+        default:
+          left = a.variables[key];
+          right = b.variables[key];
+      }
+      const result =
+        typeof left === "number" && typeof right === "number"
+          ? left - right
+          : String(left ?? "").localeCompare(String(right ?? ""), "und", { numeric: true });
+      if (result) return result;
+    }
+    return 0;
   };
   return [...matches].sort((a, b) => {
     let result = 0;
     switch (input.ordering.mode) {
       case "row-major":
         result =
+          (a.layout.blockIndex ?? 0) - (b.layout.blockIndex ?? 0) ||
           ((a.layout.rowIndex ?? 0) - (b.layout.rowIndex ?? 0)) * directionY ||
           ((a.layout.columnIndex ?? 0) - (b.layout.columnIndex ?? 0)) * directionX;
         break;
       case "column-major":
         result =
+          (a.layout.blockIndex ?? 0) - (b.layout.blockIndex ?? 0) ||
           ((a.layout.columnIndex ?? 0) - (b.layout.columnIndex ?? 0)) * directionX ||
           ((a.layout.rowIndex ?? 0) - (b.layout.rowIndex ?? 0)) * directionY;
         break;
@@ -246,19 +295,15 @@ function orderMatches(matches: Match[], input: CreateExportPlanInput): Match[] {
         break;
       case "position": {
         result =
-          positionRank(a) - positionRank(b) || (a.layout.rowIndex ?? 0) - (b.layout.rowIndex ?? 0);
+          positionRank(a) - positionRank(b) ||
+          (a.layout.blockIndex ?? 0) - (b.layout.blockIndex ?? 0) ||
+          (a.layout.rowIndex ?? 0) - (b.layout.rowIndex ?? 0);
         break;
       }
       case "hierarchy":
         break;
     }
-    return (
-      result ||
-      a.exportNode.hierarchyPath
-        .join("/")
-        .localeCompare(b.exportNode.hierarchyPath.join("/"), "und", { numeric: true }) ||
-      a.exportNode.id.localeCompare(b.exportNode.id, "en")
-    );
+    return result || compareTieBreakers(a, b);
   });
 }
 
@@ -333,7 +378,7 @@ export function compileExportPlan(
       if (rule.from !== "sequence") continue;
       const scope =
         rule.scope === "row"
-          ? `row:${match.layout.rowIndex ?? 0}`
+          ? `row:${match.layout.groupKey ?? "root"}:${match.layout.rowIndex ?? 0}`
           : rule.scope === "group"
             ? `group:${match.layout.groupKey ?? "root"}`
             : "global";
@@ -390,11 +435,13 @@ export function compileExportPlan(
       sanitizeSegment(
         renderTemplate(template, match.variables, missingTemplateVariables),
         input.naming.max_segment_length,
+        input.naming.whitespace,
       ),
     );
     const filename = sanitizeSegment(
       renderTemplate(input.naming.template, match.variables, missingTemplateVariables),
       input.naming.max_segment_length,
+      input.naming.whitespace,
     );
     const remotePath = joinRemotePath(requestedRoot, effectiveJobFolder, ...folders, filename);
     return {

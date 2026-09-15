@@ -192,6 +192,7 @@ describe("mock-server end-to-end workflow", () => {
       ordering: { mode: "row-major" },
       naming: { template: "{index}.png" },
       destination: { root: "/AI Exports", job_folder: "E2E" },
+      packaging: { mode: "filesAndZip" },
     });
     const plan = compileExportPlan(snapshot, input, "/AI Exports", 100);
     plan.status = "confirmed";
@@ -203,8 +204,14 @@ describe("mock-server end-to-end workflow", () => {
     await jobs.wait(job.id);
     const result = jobs.status(await store.getJob(job.id));
     expect(result.status).toBe("completed");
-    expect((result.totals as { verified: number }).verified).toBe(1);
-    expect(uploaded.size).toBe(1);
-    expect([...uploaded.values()][0]?.toString()).toBe("png-fixture");
+    expect((result.totals as { verified: number }).verified).toBe(2);
+    expect(uploaded.size).toBe(2);
+    expect([...uploaded.values()].some((bytes) => bytes.toString() === "png-fixture")).toBe(true);
+    expect(
+      [...uploaded.entries()].some(
+        ([remotePath, bytes]) =>
+          remotePath.endsWith(".zip") && Buffer.from(bytes).readUInt32LE(0) === 0x04034b50,
+      ),
+    ).toBe(true);
   });
 });

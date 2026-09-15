@@ -81,13 +81,17 @@ export class FigmaClient {
     }
   }
 
-  async checkConnection(): Promise<{ reachable: true; identityHint?: string }> {
-    const data = await this.requestJson<{ email?: string; handle?: string }>("/v1/me", {}, 1);
-    const source = data.email ?? data.handle;
-    if (!source) return { reachable: true };
-    const [name = "", domain] = source.split("@");
-    const masked = domain ? `${name.slice(0, 1)}***@${domain}` : `${source.slice(0, 1)}***`;
-    return { reachable: true, identityHint: masked };
+  async checkConnection(): Promise<{
+    configured: true;
+    reachable: null;
+    verification: "deferred_until_file_inspection";
+  }> {
+    this.requireToken();
+    return {
+      configured: true,
+      reachable: null,
+      verification: "deferred_until_file_inspection",
+    };
   }
 
   async getFile(

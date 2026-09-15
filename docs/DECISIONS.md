@@ -33,11 +33,26 @@ verification; incomplete job workspaces are retained.
 V1 does not expose publication as a side effect. All uploaded objects remain private. Publication
 can be added later as a separate explicitly confirmed tool.
 
-## 2026-09-14 — ZIP implemented without platform tools
+## 2026-09-14 — Streaming ZIP64 without platform tools
 
-ZIP archives use a small internal standards-compliant STORE encoder with CRC-32 and zip-slip-safe
-entry validation. This avoids shelling out to `zip` and keeps packaging identical on all operating
-systems.
+Job archives are written directly to a mode-0600 temporary file with Yazl's ZIP64 stream and
+atomically renamed when complete. Entries are validated against zip-slip, use fixed metadata for
+reproducibility, and never coexist as one in-memory byte array. Archive bytes are hashed while they
+are written and streamed from disk to Yandex Disk with upload-progress timeouts. The small exported
+`createZip` helper remains only for bounded in-memory callers and unit fixtures. No operating-system
+`zip` command or native binary is required on Linux, macOS, or Windows.
+
+## 2026-09-14 — Layout indexes are local to visual blocks
+
+Rows and columns are clustered within a common parent/section block. Their one-based indexes restart
+for every block, and block numbering is isolated by hierarchy depth, so nested child nodes cannot
+shift their parents' indexes. Position selection keys groups by both block identity and local index.
+
+## 2026-09-14 — Minimal Figma OAuth scope
+
+Connection readiness validates local token configuration without calling `/v1/me`. Network access
+is proven by `inspect_figma_file`, which uses the file endpoint and therefore needs only
+`file_content:read`; `current_user:read` is not required.
 
 ## Verified official API facts
 

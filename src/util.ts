@@ -34,8 +34,13 @@ export function normalizeText(value: string): string {
 const WINDOWS_RESERVED = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/iu;
 const UNSAFE_SEGMENT = /[<>:"/\\|?*]/gu;
 
-export function sanitizeSegment(raw: string, maxLength = 120): string {
-  const normalized = normalizeText(raw)
+export function sanitizeSegment(
+  raw: string,
+  maxLength = 120,
+  whitespace: "collapse" | "preserve" = "collapse",
+): string {
+  const source = whitespace === "collapse" ? normalizeText(raw) : raw.normalize("NFC");
+  const normalized = source
     .replace(/[\s\S]/gu, (character) => {
       const code = character.codePointAt(0);
       return code !== undefined && code < 32 ? "_" : character;
@@ -64,7 +69,7 @@ export function joinRemotePath(root: string, ...segments: string[]): string {
     .replaceAll("\\", "/")
     .split("/")
     .filter(Boolean)
-    .map((item) => sanitizeSegment(item))
+    .map((item) => sanitizeSegment(item, 120, "preserve"))
     .join("/")}`;
   const safeSegments = segments
     .flatMap((segment) => segment.replaceAll("\\", "/").split("/"))
@@ -73,7 +78,7 @@ export function joinRemotePath(root: string, ...segments: string[]): string {
       if (item === "." || item === ".." || /^[A-Za-z]:[\\/]/u.test(item)) {
         throw appError("UNSAFE_PATH", "planning", "Path traversal or drive prefix is not allowed");
       }
-      return sanitizeSegment(item);
+      return sanitizeSegment(item, 120, "preserve");
     });
   const result = path.posix.join(normalizedRoot, ...safeSegments);
   const prefix = normalizedRoot === "/" ? "/" : `${normalizedRoot}/`;

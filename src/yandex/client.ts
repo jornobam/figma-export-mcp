@@ -1,3 +1,5 @@
+import { createReadStream } from "node:fs";
+import { Transform } from "node:stream";
 import type { AppConfig } from "../config.js";
 import type { FetchLike } from "../domain/types.js";
 import { AppError, appError } from "../errors.js";
@@ -135,7 +137,7 @@ export class YandexDiskClient {
     }
   }
 
-  async upload(remotePath: string, bytes: Uint8Array): Promise<void> {
+  private async uploadUrl(remotePath: string): Promise<URL> {
     const parent = remotePath.slice(0, remotePath.lastIndexOf("/")) || "/";
     await this.ensureDirectory(parent);
     const params = new URLSearchParams({
@@ -156,19 +158,39 @@ export class YandexDiskClient {
         "Yandex Disk returned an invalid upload link",
       );
     }
-    const uploadUrl = await assertSafeExternalUrl(link.href, {
+    return assertSafeExternalUrl(link.href, {
       allowPrivate: this.config.allowPrivateUrls,
     });
+  }
+
+  private async putUpload(
+    remotePath: string,
+    body: BodyInit,
+    expected: { size: number; sha256: string },
+    streamed = false,
+  ): Promise<void> {
+    const uploadUrl = await this.uploadUrl(remotePath);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.config.httpTimeoutMs);
+    let timeout: NodeJS.Timeout | undefined;
+    const armTimeout = () => {
+      if (timeout) clearTimeout(timeout);
+      timeout = setTimeout(() => controller.abort(), this.config.httpTimeoutMs);
+    };
+    armTimeout();
+    if (streamed && typeof body === "object" && body && "on" in body) {
+      (body as unknown as NodeJS.EventEmitter).on("upload-progress", armTimeout);
+    }
     try {
-      const response = await this.fetchImpl(uploadUrl, {
+      const init: RequestInit & { duplex?: "half" } = {
         method: "PUT",
-        body: bytes as BodyInit,
+        body,
         redirect: "manual",
         signal: controller.signal,
-      });
-      clearTimeout(timeout);
+        headers: { "Content-Length": String(expected.size) },
+        ...(streamed ? { duplex: "half" as const } : {}),
+      };
+      const response = await this.fetchImpl(uploadUrl, init);
+      if (timeout) clearTimeout(timeout);
       if (!response.ok) {
         throw appError(
           "YANDEX_UPLOAD_FAILED",
@@ -178,14 +200,14 @@ export class YandexDiskClient {
         );
       }
     } catch (error) {
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
       if (error instanceof AppError) throw error;
       const remote = await this.getMetadata(remotePath).catch(() => null);
       if (
         remote?.type === "file" &&
-        remote.size === bytes.byteLength &&
+        remote.size === expected.size &&
         remote.sha256 &&
-        `sha256:${remote.sha256.toLowerCase()}` === sha256(bytes).toLowerCase()
+        `sha256:${remote.sha256.toLowerCase()}` === expected.sha256.toLowerCase()
       )
         return;
       throw new AppError(
@@ -198,6 +220,35 @@ export class YandexDiskClient {
         },
         { cause: error },
       );
+    }
+  }
+
+  async upload(remotePath: string, bytes: Uint8Array): Promise<void> {
+    await this.putUpload(remotePath, bytes as BodyInit, {
+      size: bytes.byteLength,
+      sha256: sha256(bytes),
+    });
+  }
+
+  async uploadFile(
+    remotePath: string,
+    localPath: string,
+    expected: { size: number; sha256: string },
+  ): Promise<void> {
+    const stream = createReadStream(localPath);
+    const progress = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        this.emit("upload-progress");
+        callback(null, chunk);
+      },
+    });
+    stream.on("error", (error) => progress.destroy(error));
+    stream.pipe(progress);
+    try {
+      await this.putUpload(remotePath, progress as unknown as BodyInit, expected, true);
+    } finally {
+      stream.destroy();
+      progress.destroy();
     }
   }
 

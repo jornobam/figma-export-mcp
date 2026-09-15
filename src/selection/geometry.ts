@@ -38,8 +38,20 @@ function cluster(nodes: NormalizedNode[], axis: "x" | "y", tolerance: number): C
 
 export type LayoutAnalysis = {
   layout: Map<string, LayoutInfo>;
-  rows: Array<{ index: number; nodeIds: string[]; y: number }>;
-  columns: Array<{ index: number; nodeIds: string[]; x: number }>;
+  rows: Array<{
+    index: number;
+    nodeIds: string[];
+    y: number;
+    blockIndex: number;
+    groupKey: string;
+  }>;
+  columns: Array<{
+    index: number;
+    nodeIds: string[];
+    x: number;
+    blockIndex: number;
+    groupKey: string;
+  }>;
   toleranceX: number;
   toleranceY: number;
   warnings: string[];
@@ -58,9 +70,10 @@ export function analyzeGeometry(
     const key = options.global ? "global" : (node.parentId ?? node.section ?? node.page ?? "root");
     partitions.set(key, [...(partitions.get(key) ?? []), node]);
   }
-  const rowClusters: Cluster[] = [];
-  const columnClusters: Cluster[] = [];
+  const rows: LayoutAnalysis["rows"] = [];
+  const columns: LayoutAnalysis["columns"] = [];
   const layout = new Map<string, LayoutInfo>();
+  const warnings: string[] = [];
   const dimensionToleranceFactor = options.dimensionToleranceFactor ?? 0.15;
   const orderedPartitions = [...partitions.entries()].sort(([, a], [, b]) => {
     const firstA = [...a].sort(
@@ -81,7 +94,11 @@ export function analyzeGeometry(
       (firstA?.id ?? "").localeCompare(firstB?.id ?? "", "en")
     );
   });
-  for (const [blockOffset, [, partition]] of orderedPartitions.entries()) {
+  const blockCountersByDepth = new Map<number, number>();
+  for (const [partitionKey, partition] of orderedPartitions) {
+    const depth = options.global ? 0 : (partition[0]?.hierarchyPath.length ?? 0);
+    const blockIndex = (blockCountersByDepth.get(depth) ?? 0) + 1;
+    blockCountersByDepth.set(depth, blockIndex);
     const medianWidth = median(partition.map((node) => node.bounds?.width ?? 0));
     const medianHeight = median(partition.map((node) => node.bounds?.height ?? 0));
     for (const node of partition) {
@@ -92,61 +109,66 @@ export function analyzeGeometry(
         Math.abs(width - medianWidth) <= Math.max(1, medianWidth * dimensionToleranceFactor) &&
         Math.abs(height - medianHeight) <= Math.max(1, medianHeight * dimensionToleranceFactor);
       layout.set(node.id, {
-        blockIndex: blockOffset + 1,
-        groupKey: node.parentId ?? node.section ?? node.page ?? "root",
+        blockIndex,
+        groupKey: partitionKey,
         dimensionsSimilarToPeers: similar,
       });
     }
-    rowClusters.push(...cluster(partition, "y", toleranceY));
-    columnClusters.push(...cluster(partition, "x", toleranceX));
-  }
-  rowClusters.sort(
-    (a, b) =>
-      a.center - b.center || (a.nodes[0]?.id ?? "").localeCompare(b.nodes[0]?.id ?? "", "en"),
-  );
-  columnClusters.sort(
-    (a, b) =>
-      a.center - b.center || (a.nodes[0]?.id ?? "").localeCompare(b.nodes[0]?.id ?? "", "en"),
-  );
-  const rows = rowClusters.map((row, rowOffset) => {
-    const ordered = [...row.nodes].sort(
-      (a, b) => (a.bounds?.x ?? 0) - (b.bounds?.x ?? 0) || a.id.localeCompare(b.id, "en"),
+    const partitionRows = cluster(partition, "y", toleranceY).sort(
+      (a, b) =>
+        a.center - b.center || (a.nodes[0]?.id ?? "").localeCompare(b.nodes[0]?.id ?? "", "en"),
     );
-    ordered.forEach((node, columnOffset) => {
-      layout.set(node.id, {
-        ...(layout.get(node.id) ?? {}),
-        rowIndex: rowOffset + 1,
-        columnIndex: columnOffset + 1,
-        groupKey: node.parentId ?? node.section ?? node.page ?? "root",
+    const partitionColumns = cluster(partition, "x", toleranceX).sort(
+      (a, b) =>
+        a.center - b.center || (a.nodes[0]?.id ?? "").localeCompare(b.nodes[0]?.id ?? "", "en"),
+    );
+    for (const [rowOffset, row] of partitionRows.entries()) {
+      const ordered = [...row.nodes].sort(
+        (a, b) => (a.bounds?.x ?? 0) - (b.bounds?.x ?? 0) || a.id.localeCompare(b.id, "en"),
+      );
+      ordered.forEach((node, columnOffset) => {
+        layout.set(node.id, {
+          ...(layout.get(node.id) ?? {}),
+          rowIndex: rowOffset + 1,
+          columnIndex: columnOffset + 1,
+          groupKey: partitionKey,
+        });
       });
-    });
-    return { index: rowOffset + 1, nodeIds: ordered.map((node) => node.id), y: row.center };
-  });
-  const columns = columnClusters.map((column, offset) => ({
-    index: offset + 1,
-    nodeIds: [...column.nodes]
-      .sort((a, b) => (a.bounds?.y ?? 0) - (b.bounds?.y ?? 0) || a.id.localeCompare(b.id, "en"))
-      .map((node) => node.id),
-    x: column.center,
-  }));
-  const rowLengths = rows.map((row) => row.nodeIds.length);
-  const warnings: string[] = [];
-  if (new Set(rowLengths).size > 1)
-    warnings.push(`Rows have unequal lengths: ${rowLengths.join(", ")}`);
-  for (const row of rows) {
-    const rowNodes = row.nodeIds
-      .map((id) => nodes.find((node) => node.id === id))
-      .filter((node): node is NormalizedNode => Boolean(node?.bounds));
-    for (let index = 1; index < rowNodes.length; index += 1) {
-      const previous = rowNodes[index - 1];
-      const current = rowNodes[index];
-      if (
-        previous?.bounds &&
-        current?.bounds &&
-        previous.bounds.x + previous.bounds.width > current.bounds.x
-      ) {
-        warnings.push(`Overlapping nodes in row ${row.index}: ${previous.id}, ${current.id}`);
+      rows.push({
+        index: rowOffset + 1,
+        nodeIds: ordered.map((node) => node.id),
+        y: row.center,
+        blockIndex,
+        groupKey: partitionKey,
+      });
+      for (let index = 1; index < ordered.length; index += 1) {
+        const previous = ordered[index - 1];
+        const current = ordered[index];
+        if (
+          previous?.bounds &&
+          current?.bounds &&
+          previous.bounds.x + previous.bounds.width > current.bounds.x
+        ) {
+          warnings.push(
+            `Overlapping nodes in block ${blockIndex}, row ${rowOffset + 1}: ${previous.id}, ${current.id}`,
+          );
+        }
       }
+    }
+    columns.push(
+      ...partitionColumns.map((column, offset) => ({
+        index: offset + 1,
+        nodeIds: [...column.nodes]
+          .sort((a, b) => (a.bounds?.y ?? 0) - (b.bounds?.y ?? 0) || a.id.localeCompare(b.id, "en"))
+          .map((node) => node.id),
+        x: column.center,
+        blockIndex,
+        groupKey: partitionKey,
+      })),
+    );
+    const rowLengths = partitionRows.map((row) => row.nodes.length);
+    if (new Set(rowLengths).size > 1) {
+      warnings.push(`Rows in block ${blockIndex} have unequal lengths: ${rowLengths.join(", ")}`);
     }
   }
   return { layout, rows, columns, toleranceX, toleranceY, warnings };
